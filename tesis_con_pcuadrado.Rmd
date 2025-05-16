@@ -22,16 +22,19 @@ library(spacetime)
 library(sp)
 library(dplyr)
 library(FRK)
+library(matlib)
+library(FactoMineR)
+library(factoextra)
 ```
 
 
 Armamos a la matriz A
 ```{r}
-n<-100
+n<-200
 p<-13
 means <- runif(p, min = -0.5, max = 0.5)
 
-stdvs <- runif(p, min = 0, max = 1)
+stdvs <- runif(p, min = 0, max = 2)
 
 A = matrix(NA, nrow = n, ncol = p)
 for (i in 1:n){
@@ -40,23 +43,17 @@ for (i in 1:n){
   }
 }
 
-rand_transformation_matrix <- matrix(runif(p*p,min=0, max = 1), ncol=p, nrow=p)
+#rand_transformation_matrix <- matrix(runif(p*p,min=0, max = 1), ncol=p, nrow=p)
 
-random_A <- scale(A %*% rand_transformation_matrix, scale = TRUE, center =  TRUE)
+random_A <- A #%*% rand_transformation_matrix
 ```
 
 ```{r}
-B = array(NA, dim = c(n, p*(p+1)/2))
-for(i in 1:n){
-  contador = 1
-  for(j in 1:p){
-    for(k in 1:j){
-      B[i,contador] <-(2-(k==j))*random_A[i,j]*random_A[i,k]
-      contador = contador + 1
-    }
-  }
-}
+B = array(NA, dim = c(n, p*p))
 
+for(i in 1:n){
+  B[i,] <-vec(random_A[i,]%*%t(random_A[i,]))
+}
 
 ```
 
@@ -73,6 +70,7 @@ randFuncA<-fd(t(random_A),splinebasisA)
 randFuncA$fdnames <- list("x", "Sample" = range(1,n), "y")
 plot(randFuncA)
 
+randFuncA <- randFuncA
 
 ```
 
@@ -93,14 +91,28 @@ plot(beta_t)
 
 
 ```{r}
+mu_t <- 5
+mu_s <- 5
+sigma <- 1
+
+"gamma_ts <- matrix(0, nrow = n, ncol = n)
+for(i in 1:n){
+  for(j in 1:n){
+    t <- t_vals[i]
+    s <- s_vals[j]
+    gamma_ts[i,j] <- exp(-((t - mu_t)^2 + (s - mu_s)^2) / (2 * sigma^2))
+  }
+}"
+
 gamma_ts <- matrix(0, nrow = n, ncol = n)
 for(i in 1:n){
   for(j in 1:n){
     t <- t_vals[i]
     s <- s_vals[j]
-    gamma_ts[i,j] <- sin(t-(4/pi))*exp(s/pi)
+    gamma_ts[i,j] <- 5*t
   }
 }
+
 
 persp(t_vals, s_vals, gamma_ts,
       theta = 60, phi = 40,      # ángulos de vista
@@ -111,8 +123,9 @@ persp(t_vals, s_vals, gamma_ts,
 y <- as.vector(gamma_ts)
 eval_basis_t <- eval.basis(t_vals,splinebasisA)
 eval_basis_s <- eval.basis(s_vals,splinebasisA)
-matThita <-matrix(NA,n^2,p*(p+1)/2)
-contador_fila = 1
+
+#matThita <-matrix(NA,n^2,p*(p+1)/2)
+"contador_fila = 1
 for(s in 1:n){
   for(t in 1:n){
     contador_columna = 1
@@ -125,14 +138,14 @@ for(s in 1:n){
     }
     contador_fila = contador_fila + 1
   }
-}
-#matThita <- kronecker.prod(eval.basis(t_vals,splinebasisA),eval.basis(s_vals,splinebasisA))
+}"
+matThita <- kronecker.prod(eval.basis(t_vals,splinebasisA),eval.basis(s_vals,splinebasisA))
 
-gamma_coef = lsfit(matThita, y,intercept=FALSE)$coef
+gamma = lsfit(matThita, y,intercept=FALSE)$coef
 #gamma_coef = matthita/y
 
 
-persp(t_vals, s_vals, matrix((matThita%*%gamma_coef),n,n),
+persp(t_vals, s_vals, matrix((matThita%*%gamma),n,n),
       theta = 60, phi = 40,      # ángulos de vista
       expand = 0.5, col = "lightblue",
       xlab = "X", ylab = "Y", zlab = "Z")
@@ -145,38 +158,38 @@ persp(t_vals, s_vals, matrix((matThita%*%gamma_coef),n,n),
 
 phi <- inprod(splinebasisA,splinebasisA)
 
-
 ```
 
 ```{r}
 p<-dim(phi)[1]
 
-mapeo_indices_omega_a_phi <- vector("list", p*(p+1)/2)
+mapeo_indices_omega_a_phi <- vector("list", p*p)
 contador <- 1
 for(i in 1:dim(phi)[1]){
-  for(j in 1:i){
+  for(j in 1:dim(phi)[1]){
     mapeo_indices_omega_a_phi[[contador]] <- c(i, j)
     contador <- contador + 1
   }
 }
 
-omega <- array(NA, dim = c(p*(p+1)/2, p*(p+1)/2))
-for(i in 1:(p*(p+1)/2)){
-  for(j in 1:(p*(p+1)/2)){
+"omega<-t(kronecker.prod(phi,phi))"
+omega <- array(NA, dim = c(p*p, p*p))
+for(i in 1:(p*p)){
+  for(j in 1:(p*p)){
     indices_i_en_phi <- mapeo_indices_omega_a_phi[[i]]
     indices_j_en_phi <- mapeo_indices_omega_a_phi[[j]]
     omega[i,j] <- phi[indices_i_en_phi[1],indices_j_en_phi[1]] * phi[indices_i_en_phi[2],indices_j_en_phi[2]] 
-                + phi[indices_i_en_phi[1],indices_j_en_phi[2]] * phi[indices_i_en_phi[2],indices_j_en_phi[1]]
-                + phi[indices_i_en_phi[2],indices_j_en_phi[1]] * phi[indices_i_en_phi[1],indices_j_en_phi[2]]   
-                + phi[indices_i_en_phi[2],indices_j_en_phi[2]] * phi[indices_i_en_phi[1],indices_j_en_phi[1]]
   }
 }
 ```
 
 
 ```{r}
+A.Phi <-random_A%*%phi
+B.Omega <- B%*%omega
 
-C = random_A%*%phi%*%beta + B%*%omega%*%gamma_coef
+
+C = A.Phi%*%beta + B.Omega%*%gamma
 
 ```
 ```{r}
@@ -190,369 +203,233 @@ y_resp = rbinom(length(C),1,pi)
 
 Simulación hecha! ahora a correr nuestras estimaciones.
 ```{r}
-library(FactoMineR)
-library(factoextra)
-pca_aphi <- prcomp(round(random_A%*%phi,3))
+
+pca_aphi <- prcomp(A.Phi)
 summary(pca_aphi)
 fviz_screeplot(pca_aphi)
-v <- round(pca_aphi$rotation, digits = 2)
-zeta <- round(round((random_A%*%phi),digits = 2)%*%v, digits = 2)
+V <- pca_aphi$rotation
+zeta <- A.Phi%*%V
 
-pca_bomega <- prcomp(round(B%*%omega,3))
+pca_bomega <- prcomp(B.Omega)
 summary(pca_bomega)
 fviz_screeplot(pca_bomega)
-W <- round(pca_bomega$rotation, digits = 2)
-kappa <- round(round((B%*%omega),digits = 2)%*%W, digits = 2)
+W <- pca_bomega$rotation
+kappa <- B.Omega%*%W
 ```
 
+```{r}
+
+lr.fpc <- function(df, zeta_pcs, kappa_pcs, V, W){
+  
+  zeta_names <- paste0("zeta.PC", zeta_pcs)
+  kappa_names <- paste0("kappa.PC", kappa_pcs)
+  
+  predictors <- c(zeta_names, kappa_names)
+  formula_str <- paste("y ~ 0 +", paste(predictors, collapse = " + "))
+  glm_formula <- as.formula(formula_str)
+  
+  glm_model = glm(glm_formula,  data = df, family = "binomial")
+  coef_estimados <- glm_model$coefficients
+  
+  summary(glm_model)
+  
+  beta_est <- V[, zeta_pcs] %*% coef_estimados[1:length(zeta_pcs)]
+  gamma_est <- W[, kappa_pcs] %*% coef_estimados[(length(zeta_pcs)+1):(length(zeta_pcs) + length(kappa_pcs))]
+  print(summary(glm_model))
+  return(list(beta_est, gamma_est))
+  }
+```
 ```{r}
 "round(zeta%*% t(v),3)
 round(A%*%phi,3)
 "
 df = data.frame(y=y_resp,zeta=zeta,kappa = kappa)
+zeta_pcs <- c(1:2)
+kappa_pcs <- c(1:15)
+res <- lr.fpc(df,zeta_pcs,kappa_pcs,V,W)
+beta_est <- res[[1]]
+gamma_est <- res[[2]]
 
-glm_model = glm(y ~ zeta.PC1 + zeta.PC2 + zeta.PC3  + kappa.PC1 + kappa.PC2 + kappa.PC3,  data = df, family = "binomial")
-coef_estimados <- glm_model$coefficients
+```
 
-coef_estimados <- matrix(coef_estimados[2:7],ncol = 1, nrow = 6)
+```{r}
 
-beta_est <- round(v[,1:3] %*% coef_estimados[1:3], digits = 4)
-gamma_est <- round(W[,1:3]%*% coef_estimados[4:6], digits = 4)
+beta_est_fd<-fd(beta_est,splinebasisA)
+plot(beta_est_fd, main = "Estimación de Beta")
+plot(beta_fd, main = "Beta Verdadera")
+```
 
-#glm_model = glm(y ~ . , data = df, family = "binomial")
+
+```{r}
+
+persp(t_vals, s_vals, gamma_ts,
+      theta = 40, phi = 40,      # ángulos de vista
+      expand = , col = "lightblue", shade=.4, border=NA, 
+      xlab = "X", ylab = "Y", zlab = "Z", main = "gamma verdadera")
+
+persp(t_vals, s_vals, matrix((matThita%*%gamma_est),n,n),
+      theta = 40, phi = 40, shade=.4, border=NA,      # ángulos de vista
+      expand = 1, col = "lightblue",
+      xlab = "X", ylab = "Y", zlab = "Z", main = "gamma estimada")
+
+
+
+```
+Acá quiero ver que tomar a las functional principal components eslo mismo que tomar a las coordenadas dadas por phi^(1/2)G con G la matriz que tiene por columnas a los autovectores asociados a las PC's de A(Phi^1/2)
+```{r}
+fun_pca <- pca.fd(randFuncA, nharm = 2)
+plot(fun_pca$harmonics)
+fun_pca$values
+
+aPhisqrt <- A %*% phi^(1/2)
+aPhisqrt.pca <- prcomp(aPhisqrt)
+G <- aPhisqrt.pca$rotation
+coord_fpc_APhi <- inv(phi^(1/2))%*%G[,1:2]
+fpcs_fd_APhi <- fd(coord_fpc_APhi, splinebasisA)
+plot(fpcs_fd_APhi*(-1))
+coord_fpc_APhi <- inv(phi^(1/2))%*%G
+pcs.APhisqrt <- aPhisqrt.pca$sdev
+pcs.APhisqrt
+
+V <- aPhisqrt.pca$rotation
+zeta <- aPhisqrt.pca$x
+
+
+```
+Se parecen masomenos. Hay que recordar que cada función esta multiplicada con un signo aleatorio pero medio que no nos importa mucho esto en el analisis.
+Con los f_ij podemos entonces estimar a las coordenadas de beta 
+hacemos lo mismo y buscamos a los g_ij para estimar a las coordenadas de gamma
+
+Despues, hacemos PCA de aphi1/2 y bomega1/2 y ponemos esto como covariables del modelo logistico. Los coef estimados van a ser los correspondientes a los xi/kappa que usamos para estimar con los f_ij/g_ij a las coordenadas de beta/kappa
+```{r}
+
+bOmegasqrt <- B %*% omega^(1/2)
+bOmegasqrt.pca<- prcomp(bOmegasqrt)
+H <- bOmegasqrt.pca$rotation
+coord_fpc_BOmega <- inv(omega^(1/2))%*%H
+pcs.bOmegasqrt.pca <- bOmegasqrt.pca$sdev
+
+summary(bOmegasqrt.pca)
+fviz_screeplot(bOmegasqrt.pca)
+W <- bOmegasqrt.pca$rotation
+kappa <- bOmegasqrt.pca$x
+```
+
+```{r}
+"round(zeta%*% t(v),3)
+round(A%*%phi,3)
 "
+
+
+df = data.frame(y=y_resp,zeta=zeta,kappa = kappa)
+
+zeta_pcs <- c(1:3)
+kappa_pcs <- c(1:11)
+
+res <- lr.fpc(df,zeta_pcs,kappa_pcs,coord_fpc_APhi,coord_fpc_BOmega)
+beta_est <- res[[1]]
+gamma_est <- res[[2]]
+```
+```{r}
+zeta_pcs <- c(1:3)
+kappa_pcs <- c(1:10)
+
+zeta_names <- paste0("zeta.PC", zeta_pcs)
+kappa_names <- paste0("kappa.PC", kappa_pcs)
+
+predictors <- c(zeta_names, kappa_names)
+formula_str <- paste("y ~ 0 +", paste(predictors, collapse = " + "))
+glm_formula <- as.formula(formula_str)
+
+#glm_model = glm(glm_formula,  data = df, family = "binomial")
 coef_estimados <- glm_model$coefficients
 
-coef_estimados <- matrix(coef_estimados[2:27],ncol = 1, nrow = 26)
+summary(glm_model)
 
-beta_est <- round(v[,1:13] %*% coef_estimados[1:13], digits = 4)
-gamma_est <- round(W[,1:13]%*% coef_estimados[14:26], digits = 4) "
+beta_est <- coord_fpc_APhi[, zeta_pcs] %*% coef_estimados[1:length(zeta_pcs)]
+gamma_est <- coord_fpc_BOmega[, kappa_pcs] %*% coef_estimados[(length(zeta_pcs)+1):(length(zeta_pcs) + length(kappa_pcs))]
 
-"print(beta_est)
-print(beta)
-
-print(gamma_est)
-print(gamma)"
 
 ```
 ```{r}
 
 beta_est_fd<-fd(beta_est,splinebasisA)
-plot(beta_est_fd)
-plot(beta_fd)
-
-```
-```{r}
-gamma_est_mat <- array(NA,dim = c(p,p))
-
-m<-1
-for(i in 1:p){
-  for (j in 1:i){
-    gamma_est_mat[i,j] <- gamma_est[m]
-    m<-m+1
-  }
-}
-for(i in 1:p){
-  for (j in 1:i){
-    gamma_est_mat[j,i] <- gamma_est_mat[i,j]
-  }
-}
+plot(beta_est_fd, main = "Estimación de Beta")
+plot(beta_fd, main = "Beta Verdadera")
 ```
 
+
 ```{r}
-
-coefnames<-list('t','s')
-#randFuncA.bif = bifd(gamma_est, splinebasisA, splinebasisA, coefnames)
-
-varbifd <- bifd(gamma_est_mat, splinebasisA, splinebasisA)
-
-
-logprec.varmat = eval.bifd(t_vals, s_vals,
- varbifd)
 
 persp(t_vals, s_vals, gamma_ts,
+      theta = 40, phi = 40,      # ángulos de vista
+      expand = , col = "lightblue", shade=.4, border=NA, 
+      xlab = "X", ylab = "Y", zlab = "Z", main = "gamma verdadera")
+
+gamma_estimado <- matrix((matThita%*%gamma_est),n,n)
+persp(t_vals, s_vals, gamma_estimado,
+      theta = 40, phi = 40, shade=.4, border=NA,      # ángulos de vista
+      expand = 1, col = "lightblue",
+      xlab = "X", ylab = "Y", zlab = "Z", main = "gamma estimada")
+
+
+
+```
+Ultimo enfoque que hablaria: Usemos la base de FPCA en el desarrollo y ahora nuestros phi y omega van a ser el prod interno entre las FPC's 
+
+
+```{r}
+nharm <- 3
+FuncA.FPCA <- pca.fd(randFuncA, nharm = nharm)
+
+pepe<-FuncA.FPCA$harmonics$basis
+
+basis.FPCA <- FuncA.FPCA$harmonics
+
+plot(FuncA.FPCA$harmonics)
+
+coord.X.basis.FPCA <- FuncA.FPCA$scores
+
+coord.Xquad.basis.FPCA <- array(NA, dim = c(n, nharm))
+for (fila in 1:n) {
+  for (i in 1:nharm) {
+    indices <- mapeo_indices_omega_a_phi[[i]]
+    xi_1 <- coord.X.basis.FPCA[fila, indices[1]]
+    xi_2 <- coord.X.basis.FPCA[fila, indices[2]]
+    coord.Xquad.basis.FPCA[fila, i] <- xi_1 * xi_2
+  } 
+}
+
+df = data.frame(y=y_resp,zeta=coord.FA.basis.FPCA, kappa = coord.Xquad.basis.FPCA)
+
+glm_model = glm(y ~ 0 + .,  data = df, family = "binomial")
+coef_estimados <- glm_model$coefficients
+
+summary(glm_model)
+
+beta_est <- basis.FPCA$coefs%*%coef_estimados[1:nharm]
+beta_est_fd<-fd(coef=beta_est,basis= FuncA.FPCA$harmonics$basis)
+plot(beta_est_fd)
+
+
+matGeiegenfuctions <-  eval.fd(t_vals,FuncA.FPCA$harmonics)
+
+gamma_est <- basis.FPCA$coefs%*%coef_estimados[(nharm+1):length(coef_estimados)] 
+
+gamma_estimado <- matrix((matGeiegenfuctions%*%gamma_est),n,n)
+
+persp(t_vals, s_vals, matrix((matThita%*%gamma),n,n),
       theta = 60, phi = 40,      # ángulos de vista
       expand = 0.5, col = "lightblue",
       xlab = "X", ylab = "Y", zlab = "Z")
-
-persp(t_vals, s_vals, matrix((matThita%*%gamma_est),n,n),
-      theta = 60, phi = 40,      # ángulos de vista
-      expand = 0.5, col = "lightblue",
-      xlab = "X", ylab = "Y", zlab = "Z")
+#gamma_est <- W[, kappa_pcs] %*% coef_estimados[(length(zeta_pcs)+1):(length(zeta_pcs) + length(kappa_pcs))]
+#print(summary(glm_model))
+#return(list(beta_est, gamma_est))
 
 
-
-```
-
-
-
-```{r}
-varfa<-var.fd(randFuncA)
-randFuncA.bif_mat = eval.bifd(t_vals, s_vals,
- varfa)
-persp(t_vals, s_vals, randFuncA.bif_mat,
-theta=-45, phi=25, r=3, expand = 0.5,
-ticktype='detailed',
-xlab="Day (July 1 to June 30)",
-ylab="Day (July 1 to June 30)",
-zlab="variance(log10 precip)")
-
-
-
-
-basis_bi<-cbind(splinebasisA,splinebasisA)
-randFuncA.bif.fd <- fd(coef = randFuncA.bif$coefs, basisobj = splinebasisA)
-randFuncA.bif.fd <- fd(coef = randFuncA.bif.fd$coef, basisobj = splinebasisA)
-
-"basis_bi<-cbind(splinebasisA,splinebasisA)
-G <- TensorP(splinebasisA,splinebasisA)
-randFuncGamma <- fd(coef = gamma_est, basisobj = splinebasisA)
-randFuncA.bif<- var.fd(randFuncA)"
-
-#gamma_est_fd<-fd(fd(gamma_est,splinebasisA),splinebasisA)
-```
-
-
-```{r}
-```
-
-Simulo datos de test ponele
-```{r}
-n<-100
-p<-13
-means <- runif(p, min = 0, max = 1)
-
-stdvs <- runif(p, min = 0, max = 3)
-
-Atest = matrix(NA, nrow = n, ncol = p)
-for (i in 1:n){
-  for (j in 1:p){
-    Atest[i,j] <- rnorm(1, mean = means[j], sd = stdvs[j])
-  }
-}
-
-rand_transformation_matrix <- matrix(runif(p*p,min=0, max = 1), ncol=p, nrow=p)
-
-random_Atest <- scale(Atest %*% rand_transformation_matrix, scale = TRUE, center =  TRUE)
-
-randFuncAtest<-fd(t(random_Atest),splinebasisA)
-randFuncAtest$fdnames <- list("x", "Sample" = range(1,n), "y")
-plot(randFuncAtest)
-
-C_test = random_Atest%*%phi%*%beta 
-"+ B%*%omega%*%gamma"
-
-
-
-pi_test = exp(C_test)/(1+exp(C_test))           # pass through an inv-logit function
-y_test = rbinom(length(C_test),1,pi)
-
-pca_aphi <- prcomp(round(random_Atest%*%phi,3))
-v <- round(pca_aphi$rotation, digits = 2)
-zeta <- round(round((random_Atest%*%phi),digits = 2 )%*%v, digits = 2)
-
-"round(zeta%*% t(v),3)
-round(A%*%phi,3)
-"
-df = data.frame(y=y_test,zeta=zeta)
-
-probs <- predict(glm_model, newdata = df, type = "response")
-clases_predichas <- ifelse(probs > 0.5, 1, 0)
-
-# 2. Calcular accuracy
-accuracy <- mean(clases_predichas == y_test)
-
-```
-
-
-```{r}
-set.seed(123)  # para reproducibilidad
-k=4
-train_indices <- sample(1:n, size = 0.8 * n)  # 80% para entrenamiento
-
-X_train <- (A%*%phi)[train_indices, ]
-y_train <- y_resp[train_indices]
-
-X_test <- (A%*%phi)[-train_indices, ]
-y_test <- y_resp[-train_indices]
-
-PCA_APhi <- prcomp(x = X_train,scale. =  TRUE)
-
-V_1 <- PCA_APhi$rotation
-"PCA_BOmega <- prcomp(B%*%omega, scale. = TRUE)"
-zeta <- PCA_APhi$x
-
-fasdfas <-V_1%*% t(V_1)
-
-zeta %*% t(V_1)
-X_train
-
-df = data.frame(y=y_train,zeta=zeta)
-
-#glm_model =glm(y~zeta,data=df,family="binomial")
-df = data.frame(y = y_train, PC1 = zeta[,1], PC2 = zeta[,2], PC3 = zeta[,3], PC4 = zeta[,4])
-glm_model = glm(y ~ PC1 + PC2 + PC3 + PC4, data = df, family = "binomial")
-
-coef_estimados <- glm_model$coefficients[1:k+1]
-coef_estimados
-coef_estimados <- matrix(coef_estimados,ncol = 1, nrow = k)
-
-beta_est <-  V_1 %*% coef_estimados
-
-
-print(t(beta_est))
-print(beta)
-
-"eta <- PCA_BOmega"
-
-```
-```{r}
-PCA_APhi_test <- prcomp(X_test,scale. =  TRUE)
-V_1_test <- PCA_APhi_test$rotation[1:p]
-
-zeta_test <- (X_test%*%t(PCA_APhi_test$rotation))[,1:4] 
-test_df <- data.frame(PC1 = zeta_test[,1], PC2 = zeta_test[,2] , PC3 = zeta_test[,3], PC4 = zeta_test[,4])
-pred <- predict(glm_model, newdata = test_df, type = "response")
-
-
-rmse <- sqrt(mean((y_test - pred)^2))
-```
-
-
-```{r}
-PCA_APhi <- prcomp(X_test,scale. =  TRUE)
-
-zeta_test <- PCA_APhi$x[,1:2]
-
-df = data.frame(y=y_test,zeta=zeta_test)
-
-predict(glm,df)
+#recuperolafuncion <- fd(coef=coord.FA.basis.FPCA, basisobj = basis.FPCA)
+#plot(recuperolafuncion)
 
 
 ```
 
-
-```{r}
-PCA_APhi <- prcomp(A%*%phi, scale. = TRUE)
-PCA_BOmega <- prcomp(B%*%omega, scale. = TRUE)
-zeta <- scale(A%*%phi)%*%t(PCA_APhi$rotation)
-eta <- scale(B%*%omega)%*%t(PCA_BOmega$rotation)
-
-scale(A%*%phi)%*%t(PCA_APhi$rotation)
-
-df = data.frame(y=y_resp,zeta=zeta,eta=eta)
-
-glm =glm(y~zeta+eta,data=df,family="binomial")
-
-coef_estimados <- c(glm$coefficients)
-coef_estimados
-
-V_1 <- PCA_APhi$rotation
-beta_est <- coef_estimados[2:3] %*% t(V_1[,1:2])
-
-print(t(beta_est))
-print(beta)
-
-```
-
-
-
-```{r}
-coef_estimados
-```
-
-
-```{r}
-library(refund)
-##########################
-#### True function   #####
-##########################
-n1 <- 60
-n2 <- 80
-x <- (1:n1)/n1-1/2/n1
-z <- (1:n2)/n2-1/2/n2
-MY <- array(0,c(length(x),length(z)))
-
-sigx <- .3
-sigz <- .4
-for(i in 1:length(x))
-for(j in 1:length(z))
-{
-#MY[i,j] <- .75/(pi*sigx*sigz) *exp(-(x[i]-.2)^2/sigx^2-(z[j]-.3)^2/sigz^2)
-#MY[i,j] <- MY[i,j] + .45/(pi*sigx*sigz) *exp(-(x[i]-.7)^2/sigx^2-(z[j]-.8)^2/sigz^2)
-MY[i,j] = sin(2*pi*(x[i]-.5)^3)*cos(4*pi*z[j])
-}
-##########################
-#### Observed data   #####
-##########################
-sigma <- 1
-Y <- MY + sigma*rnorm(n1*n2,0,1)
-##########################
-####   Estimation    #####
-##########################
-
-est <- fbps(Y,list(x=x,z=z))
-est$Theta
-mse <- mean((est$Yhat-MY)^2)
-cat("mse of fbps is",mse,"\n")
-cat("The smoothing parameters are:",est$lambda,"\n")
-########################################################################
-########## Compare the estimated surface with the true surface #########
-########################################################################
-
-par(mfrow=c(1,2))
-persp(x,z,MY,zlab="f(x,z)",zlim=c(-1,2.5), phi=30,theta=45,expand=0.8,r=4,
-      col="blue",main="True surface")
-persp(x,z,est$Yhat,zlab="f(x,z)",zlim=c(-1,2.5),phi=30,theta=45,
-      expand=0.8,r=4,col="red",main="Estimated surface")
-```
-
-
-```{r}
-library(splines)
-library(ggplot2)
-
-# Paso 1: Definir la función y los nodos
-t_nodes <- -1:11
-y_values <- sin(t_nodes - pi/4)
-
-# Paso 2: Crear una spline cúbica natural (interpolación)
-# usaremos smooth.spline con lambda = 0 para interpolación exacta
-spline_fit <- smooth.spline(t_nodes, y_values, spar = 0)
-
-# Paso 3: Evaluar la spline en una grilla fina para graficar
-t_grid <- seq(0, 10, length.out = 500)
-spline_pred <- predict(spline_fit, t_grid)
-
-# Paso 4: Representar la spline en base B-spline
-# Crear la matriz de base B-spline evaluada en los nodos
-B_matrix <- bs(t_nodes, df = NULL, degree = 3, intercept = TRUE)
-
-# Usar regresión lineal para obtener los coeficientes beta
-# (esto da la proyección en la base B-spline)
-beta_hat <- lm(y_values ~ B_matrix - 1)$coefficients
-
-# Paso 5: Graficar todo
-df_plot <- data.frame(
-  t = t_grid,
-  spline = spline_pred$y,
-  true = sin(t_grid - pi/4)
-)
-
-ggplot(df_plot, aes(x = t)) +
-  geom_line(aes(y = true), color = "blue", linetype = "dashed") +
-  geom_line(aes(y = spline), color = "red") +
-  labs(title = "Spline cúbica natural vs función original",
-       y = "Valor", x = "t") +
-  theme_minimal()
-
-```
-
-```{r}
-tstFn0 <- fd(c(-1, 2), create.bspline.basis(norder=2))
-tstFn2 <- fd(c(-10, 2), create.bspline.basis(norder=2))
-
-#plot(tstFn0)
-plot(tstFn0*tstFn2)
- 
-```
