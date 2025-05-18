@@ -1,0 +1,577 @@
+---
+title: "probando fda"
+author: "santiago eliges"
+date: "2025-04-01"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Librerías
+```{r, warning=FALSE, message=FALSE}
+library('fda')        # herramientas para tratar datos funcionales  
+library('robustbase') # lmrob 
+library(fda.usc)      # dataset + herramientas como fda (derivada, por ejemplo)
+library(lattice)      # gráficos
+library(gdata)        # uppertriangle
+library(splines2)
+library(fastmatrix)
+library(spacetime)
+library(sp)
+library(dplyr)
+library(FRK)
+library(matlib)
+library(FactoMineR)
+library(factoextra)
+library(funcharts)
+```
+Para hacer la simulación, primero intento costruir a las funciones aleatorias $X_i$ simulando a la matriz A de coordenadas en la base $\phi$.
+
+Primero, definimos a la base $\phi$ como la base de Bsplines en el intervalo (0,10) con un knot en cada punto del intervalo (términamos teniendo 13 funciones en la base)
+```{r}
+# number of basis functions = order + number of interior knots
+# Bspline por defaul tiene orden 4, 9 interior knots en c(0,10) (knots interiores son sin contar los bordes)
+p<-13
+splinebasisA <- create.bspline.basis(c(0,10),p)
+plot(splinebasisA)
+```
+Armamos a la matriz A de 200 individuos con 13 coeficientes que forman su coordenadas en la base. Es decir
+$X_i(t) = \sum_{k=1}^{13} A_{ik}\phi_k(t) \quad \forall i \in (1,200)$.
+Se construye 13 normales diferentes y para cada fila de A, se samplea cada columna a partir de la distribución normal relacionada
+```{r}
+n<-200
+means <- runif(p, min = -0.5, max = 0.5)
+
+stdvs <- runif(p, min = 0, max = 2)
+
+A = matrix(NA, nrow = n, ncol = p)
+for (i in 1:n){
+  for (j in 1:p){
+    A[i,j] <- rnorm(1, mean = means[j], sd = stdvs[j])
+  }
+}
+
+#rand_transformation_matrix <- matrix(runif(p*p,min=0, max = 1), ncol=p, nrow=p)
+
+#random_A <- A #%*% rand_transformation_matrix
+```
+
+Construimos B a partir de A, donde cada fila de B esta dada por $vec(A_i^tA)$
+```{r}
+B = array(NA, dim = c(n, p*p))
+
+for(i in 1:n){
+  B[i,] <-vec(A[i,]%*%t(A[i,]))
+}
+
+```
+
+Construyo al objeto funcional
+
+```{r}
+randFuncA<-fd(t(A),splinebasisA)
+randFuncA$fdnames <- list("x", "Sample" = range(1,n), "y")
+plot(randFuncA)
+
+randFuncA <- randFuncA
+
+```
+
+Defino las funciones parámetricas
+La función esta dada por $\beta(t) = sin(t-\pi/4)$.
+Usamos la función smooth.basis para recuperar las coordenadas $\beta$ en la base $\phi$.
+Esta función de fondo evalua a la base en los valores definidos ($t \in (1,10)$) y construye una matriz que llamamos basismat. Despues, busca con cuadrados minimos (con un término de penalización) los coeficientes $beta$ de la ecuación $Y = eval.basis(\phi(t)) \beta$
+```{r}
+
+t_vals <- seq(0, 10,length.out = n)
+beta_t <- sin(t_vals - pi/4)
+basismat = eval.basis(t_vals, splinebasisA)
+beta_fd_smooth <- smooth.basis(argvals = t_vals, y = beta_t, fdParobj = splinebasisA)
+beta_fd <- beta_fd_smooth$fd
+beta <- beta_fd$coefs
+plot(beta_t, main = "Beta sampleada")
+
+plot(beta_fd, col = "red", main = "beta smootheada")
+
+```
+<span style="color:red">Problema: Intento obtener las p(p+1)/2 coordeadas de la función gamma(t,s)  en la base de p(p+1)/2 términos</span>
+<span style="color:red">Mi problema esta en asumir que puedo construir a cualquier función gamma(t,s) en la base de $p(p+1)/2$ elementos L.I. Si trato a los espacios funcionales como los vectoriales, esta base solo va a poder generarnos a las funciones simetricas. Este va a ser el mayor problema en todo el trabajo, que utilizar las bases $\phi(t), \phi(s)$ de los $X_i(t)X_i(s)$ para construir la base $\theta(t,s)$ impone la condición de simetriarespecto a t=s /span> 
+
+$eval.basis(\phi(t))$ y $eval.basis(\phi(s))$.
+Intento usar solo los p(p+1)/2 términos para construir a la gamma y sus coordenadasen la base.
+ Necesito obtener las coordenadas $\gamma_{ij}$ en las bases $\phi(t), \phi(s)$. Para esto paso a buscar las $13(13+1)/2$ coordenadas $\gamma_k$ en la base $\theta$ de $13(13+1)/2$ funciones dadas por $\theta_k = \{\phi_{J(k)_1} (t)\phi_{J(k)_2}(s) + \phi_{J(k)_2} (t)\phi_{J(k)_1} (s):1\leq k \leq p(p+1)/2\}$ donde $J(1) = (1,1), J(2) = (2,1), J(2) = (2,2)\dots,J(p) = (p,1),J(p+1) = (p,2),\dots$. es decir, que hace el triangulo inferior de la matriz de arriba a abajo izquierda a derecha.
+Hago una "implementación a mano" de smooth.basis armando la eval.matrix de la base $\theta$, donde en la fila k estan los valores de $\theta(I(k)_1,I(k)_2)$ donde $I(1) = (1,1), I(2) = (2,1), J(3) = (3,1)\dots,J(p) = (p,1),J(p+1) = (1,2),\dots$
+```{r}
+s_vals <- seq(0, 10,length.out = n)
+
+mu_t <- 2
+mu_s <- 5
+sigma <- 5
+
+
+gamma_ts <- matrix(0, nrow = n, ncol = n)
+for(i in 1:n){
+  for(j in 1:n){
+    t <- t_vals[j]
+    s <- s_vals[i]
+    gamma_ts[i,j] <- (5*t)*(3*cos(s))
+  }
+}
+
+persp(t_vals, s_vals, gamma_ts,
+      theta = 60, phi = 40,  shade=.4, border=NA,     # ángulos de vista
+      expand = 0.5, col = "lightblue",
+      xlab = "X", ylab = "Y", zlab = "Z")
+
+
+y <- as.vector(gamma_ts)
+eval_basis_t <- eval.basis(t_vals,splinebasisA)
+eval_basis_s <- eval.basis(s_vals,splinebasisA)
+
+
+matThita <-matrix(NA,n^2,p*(p+1)/2)
+contador_fila <- 1
+for(fila_t in 1:n){
+  for(fila_s in 1:n){
+    contador_columna = 1
+    for(i in 1:p){
+      for(j in 1:i){
+        matThita[contador_fila, contador_columna] <-(eval_basis_t[fila_t,i]*eval_basis_s[fila_s,j]) + (eval_basis_t[fila_t,j]*eval_basis_s[fila_s,i])
+        contador_columna = contador_columna + 1
+      }
+    }
+    contador_fila = contador_fila + 1
+  }
+}
+
+
+gamma_coef = lsfit(matThita, y,intercept=FALSE)$coef
+#gamma_coef = matthita/y
+
+
+z_matrix<-matrix((matThita%*%gamma_coef),length(t_vals),length(s_vals))
+persp_out<-persp(t_vals, s_vals, z_matrix,
+      theta = 60, phi = 40, shade=.4, border=NA,     # ángulos de vista
+      expand = 0.5, col = "lightblue",
+      xlab = "X", ylab = "Y", zlab = "Z")
+tick_pos <- seq(0, 1, by = 0.25)
+
+# EJE X (t)
+for (tick in tick_pos) {
+  xyz <- trans3d(tick, 0, min(z_matrix), persp_out)
+  text(xyz, labels = round(tick, 2), col = "black", cex = 0.7)
+}
+
+# EJE Y (s)
+for (tick in tick_pos) {
+  xyz <- trans3d(0, tick, min(z_matrix), persp_out)
+  text(xyz, labels = round(tick, 2), col = "black", cex = 0.7)
+}
+
+# EJE Z (γ)
+z_ticks <- pretty(range(z_matrix), 4)
+for (tick in z_ticks) {
+  xyz <- trans3d(0, 0, tick, persp_out)
+  text(xyz, labels = round(tick, 2), col = "black", cex = 0.7)
+}
+
+```
+
+<span style="color:yellow">Avertencia: acá se elige la gamma y se puede ver como le cuesta mucho más con gammas no simetricas</span>
+<span style="color:yellow">Las estimaciones se construyen sobre la base que forma a las $X_i^2$ que -me imagino que- adopta cierta simetría al ser construida con la combianción de los $\phi(t)\phi(s)$</span>
+DE ACA EN ADELANTE USAMOS LOS P^2 TERMINOS!
+Construyo a la gamma como $\gamma(t,s) = 5t+3s$. Necesito obtener las coordenadas $\gamma_{ij}$ en las bases $\phi(t), \phi(s)$. Para esto paso a buscar las $13^2$ coordenadas $\gamma_k$ en la base $\theta$ de $13^2$ funciones dadas por $\phi_1(t)\phi_1(s), \phi_1(t)\phi_2(s), \dots ,\phi_1(t)\phi_p(s),\phi_2(t)\phi_1(s)\dots,\phi_p(t)\phi_p(s)$.
+Hago una "implementación a mano" de smooth.basis armando la eval.matrix de la base $\theta$ como el producto Kronecker de las eval.matrix de la base $\phi$
+```{r}
+s_vals <- seq(0, 10,length.out = n)
+
+#Acá uso la gamma que es una gaussiana. 
+#Cuando se usa a esta superficie, es importante cambiar la cantidad de componentes principales para obtener una buena estimación!!
+#Yo vi que esta superficie se puede aproximar mejor con entre 7 y 10 componentes principales
+"mu_t <- 5
+mu_s <- 5
+sigma <- 1
+
+gamma_ts <- matrix(0, nrow = n, ncol = n)
+for(i in 1:n){
+  for(j in 1:n){
+    t <- t_vals[i]
+    s <- s_vals[j]
+    gamma_ts[i,j] <- exp(-((t - mu_t)^2 + (s - mu_s)^2) / (2 * sigma^2))
+  }
+}"
+
+# Acá uso la gamma formada por un plano que depende solo de t. Noté que como existe una fuerte relacion de simetria los casos como este no funcionan tan bien.
+#Cuando probamos con (5*t)+(3*s) o(15*t*s) notamos que las aproximaciones son mucho mejores y con menos PC's. 
+gamma_ts <- matrix(0, nrow = n, ncol = n)
+for(i in 1:n){
+  for(j in 1:n){
+    t <- t_vals[i]
+    s <- s_vals[j]
+    gamma_ts[i,j] <- (5*t)#+(3*s)
+  }
+}
+
+#Acá tambien veo q patologicamente funciona mal cuando no es simetrica la superfice
+"gamma_ts <- matrix(0, nrow = n, ncol = n)
+for(i in 1:n){
+  for(j in 1:n){
+    t <- t_vals[i]
+    s <- s_vals[j]
+    gamma_ts[i,j] <- (5*t)*(3*cos(s))
+  }
+}"
+
+persp(t_vals, s_vals, gamma_ts,
+      theta = 60, phi = 40, shade=.4, border=NA,    # ángulos de vista
+      expand = 0.5, col = "lightblue",
+      xlab = "X", ylab = "Y", zlab = "Z")
+
+
+y <- as.vector(gamma_ts)
+eval_basis_t <- eval.basis(t_vals,splinebasisA)
+eval_basis_s <- eval.basis(s_vals,splinebasisA)
+
+
+matThita <- kronecker.prod(eval.basis(t_vals,splinebasisA),eval.basis(s_vals,splinebasisA))
+
+gamma = lsfit(matThita, y,intercept=FALSE)$coef
+#gamma_coef = matthita/y
+
+
+persp(t_vals, s_vals, matrix((matThita%*%gamma),n,n), #Debería de poder hacer un plug-in con los gamma_estimados y obtener buenas aproximaciones de la superficie gamma
+      theta = 60, phi = 40, shade=.4, border=NA, 
+      expand = 0.5, col = "lightblue",
+      xlab = "X", ylab = "Y", zlab = "Z")
+
+
+```
+
+
+construimos a $\psi$ que es el producto interno de la base $\phi$
+```{r}
+
+psi <- inprod(splinebasisA,splinebasisA)
+
+```
+
+Construimos a la función $I(k) = (i,j)$ que mapea al indice k a la tupla i,j correspondiente dado el siguiente orden $I(1) = (1,1),I(1) = (1,2), \dots,I(p) = (1,p),I(p+1) = (2,1),\dots,I(2p) = (2,p),\dots,I(p^2) = (p,p)$.
+Con esto, podemos armar a la matriz $\Omega$ como $\Omega_{ij} = \psi_{I(i).1,I(j).1} \psi_{I(i).2,I(j).2} $
+```{r}
+
+#Función I
+mapeo_indices <- vector("list", p*p)
+contador <- 1
+for(i in 1:dim(psi)[1]){
+  for(j in 1:dim(psi)[1]){
+    mapeo_indices[[contador]] <- c(i, j)
+    contador <- contador + 1
+  }
+}
+
+"omega<-t(kronecker.prod(phi,phi))"
+omega <- array(NA, dim = c(p*p, p*p))
+for(i in 1:(p*p)){
+  for(j in 1:(p*p)){
+    indices_i_en_phi <- mapeo_indices[[i]]
+    indices_j_en_phi <- mapeo_indices[[j]]
+    omega[i,j] <- psi[indices_i_en_phi[1],indices_j_en_phi[1]] * psi[indices_i_en_phi[2],indices_j_en_phi[2]] 
+  }
+}
+```
+
+Armamos la simulación.
+```{r}
+A.Psi <-A%*%psi
+B.Omega <- B%*%omega
+
+
+C = A.Psi%*%beta + B.Omega%*%gamma
+
+```
+```{r}
+pi =plogis(C) #inv-logit function. Evita NAs
+
+```
+```{r}
+y_resp = rbinom(length(C),1,pi)
+```
+
+
+Simulación hecha! ahora a correr nuestras estimaciones.
+
+Tomo las PCA de $A\psi, B\Omega$. LLamo $\zeta_i$ la i-esima componete principal de $A\psi$ y $\eta$ la i-esima componete principal de $B\Omega$
+```{r}
+
+pca_apsi <- prcomp(A.Psi)
+summary(pca_apsi)
+fviz_screeplot(pca_apsi)
+V <- pca_apsi$rotation
+zeta <- A.Psi%*%V
+
+pca_bomega <- prcomp(B.Omega)
+summary(pca_bomega)
+fviz_screeplot(pca_bomega)
+W <- pca_bomega$rotation
+eta <- B.Omega%*%W
+```
+Defino la función que dado $Z,H,V,W$ devuelve las coordenadas $\hat\beta,\hat\gamma$ estimadas
+```{r}
+
+lr.fpc <- function(df, zeta_pcs, eta_pcs, V, W){
+  
+  zeta_names <- paste0("zeta.PC", zeta_pcs)
+  eta_names <- paste0("eta.PC", eta_pcs)
+  
+  predictors <- c(zeta_names, eta_names)
+  formula_str <- paste("y ~ 0 +", paste(predictors, collapse = " + "))
+  glm_formula <- as.formula(formula_str)
+  
+  glm_model = glm(glm_formula,  data = df, family = "binomial")
+  coef_estimados <- glm_model$coefficients
+  
+  summary(glm_model)
+  
+  xi <- coef_estimados[1:length(zeta_pcs)]
+  kappa <- coef_estimados[(length(zeta_pcs)+1):(length(zeta_pcs) + length(eta_pcs))]
+     
+  beta_est <- V[, zeta_pcs] %*% xi
+  gamma_est <- W[, eta_pcs] %*% kappa
+  print(summary(glm_model))
+  return(list(beta_est, gamma_est))
+  }
+```
+
+deberíamos ver que $ZV' = A\Psi$ ya que $Z = A\Psi V$ pero no pasa x error numerico asumo
+```{r}
+#zeta%*%t(V) == A%*%psi
+```
+
+Ajusto el modelo tomando las 3 pc's de $A\psi$ y las 20 pc'sde $B\Omega$ como covariables y recupero las estimaciones $\hat\beta, \hat\gamma$
+
+```{r}
+
+df = data.frame(y=y_resp,zeta=zeta,eta = eta)
+zeta_pcs <- c(1:4)
+eta_pcs <- c(1:20)
+res <- lr.fpc(df,zeta_pcs,eta_pcs,V,W)
+beta_est <- res[[1]]
+gamma_est <- res[[2]]
+
+```
+
+grafico la funcion beta estimada y comparo con la verdadera
+```{r}
+
+beta_est_fd<-fd(beta_est,splinebasisA)
+plot(beta_est_fd, main = "Estimación de Beta")
+plot(beta_fd, main = "Beta Verdadera")
+```
+grafico la función gamma estimada y comparo con la verdadera
+
+```{r}
+
+persp(t_vals, s_vals, gamma_ts,
+      theta = 40, phi = 40,      # ángulos de vista
+      expand = , col = "lightblue", shade=.4, border=NA, 
+      xlab = "X", ylab = "Y", zlab = "Z", main = "gamma verdadera")
+
+persp(t_vals, s_vals, matrix((matThita%*%gamma_est),n,n),
+      theta = 40, phi = 40, shade=.4, border=NA,      # ángulos de vista
+      expand = 1, col = "lightblue",
+      xlab = "X", ylab = "Y", zlab = "Z", main = "gamma estimada")
+
+
+
+```
+
+##Segundo método usando los harmonicos estimados con (A$\psi^1/2$)
+<span style="color:red">problema: No coinciden las FPC's estimadas con las pc's de $A\psi^{1/2}$ y las tomadas con la función pca.fd()}</span>
+<span style="color:red">claramente hay un problema con la escala de las pc's de $A\psi^{1/2}$, Creo que tengo que centrar las pcs</span>
+
+como explica en Algorithm for computing FPCA del paper https://digibug.ugr.es/bitstream/handle/10481/72993/Computational%20considerations%20in%20functional%20principal%20component%20analysis.pdf
+las funciones principales $f_j = \Gamma(\psi^{-1/2}v_j)$ donde $\Gamma_\phi(\alpha) = \sum_{k=1}^p \alpha_k\phi_k(t)$ y $v_j$ el j-esimo autovector asociado a la j-esima componente principal de $A(\psi^{1/2})$.
+
+Acá quiero ver que tomar a las functional principal components es lo mismo que tomar a las coordenadas dadas por $\psi^{(1/2)}G$ con G la matriz que tiene por columnas a los autovectores asociados a las PC's de $A(\psi^{1/2})$
+```{r}
+fun_pca <- pca.fd(randFuncA, nharm = 13, centerfns = FALSE)
+plot(fun_pca$harmonics, main ="Funciones Principales usando PCA.FD")
+fun_pca$values
+
+apsisqrt <- A %*% t(psi^(1/2))
+apsisqrt.pca <- prcomp(apsisqrt)
+G <- apsisqrt.pca$rotation
+coord_fpc_Apsi <- inv(psi^(1/2))%*%G[,1:13]
+fpcs_fd_Apsi <- fd(coord_fpc_Apsi, splinebasisA)
+plot(fpcs_fd_Apsi, main ="Funciones Principales usando coordenadas dadas por PCA de APsi^(1/2)")
+
+
+
+```
+Claramente no dan lo mismo. Hay un problema con la escala en principio pero no consigo encontrar el error.
+
+
+Con las coordenadas de las funciones principales $f_{ij}$ en la base $phi$ podemos estimar a las coordenadas de beta hacemos lo mismo y buscamos a los $g_{ij}$ coordenadas de las funciones principales de $X_i^2$ en $\theta$ para estimar a las coordenadas de gamma.
+
+Despues, hacemos PCA de apsi1/2 y bomega1/2 y ponemos esto como covariables del modelo logistico. Los coef estimados van a ser los correspondientes a los xi/kappa que usamos para estimar con los f_ij/g_ij a las coordenadas de beta/kappa
+```{r}
+coord_fpc_Apsi <- inv(psi^(1/2))%*%G
+V <- apsisqrt.pca$rotation
+zeta <- apsisqrt.pca$x
+
+
+bOmegasqrt <- B %*% t(omega^(1/2))
+bOmegasqrt.pca<- prcomp(bOmegasqrt)
+H <- bOmegasqrt.pca$rotation
+coord_fpc_BOmega <- inv(omega^(1/2))%*%H
+pcs.bOmegasqrt.pca <- bOmegasqrt.pca$sdev
+
+summary(bOmegasqrt.pca)
+fviz_screeplot(bOmegasqrt.pca)
+W <- bOmegasqrt.pca$rotation
+kappa <- bOmegasqrt.pca$x
+```
+
+```{r}
+
+df = data.frame(y=y_resp,zeta=zeta,eta = eta)
+
+zeta_pcs <- c(1:3)
+eta_pcs <- c(1:11)
+
+res <- lr.fpc(df,zeta_pcs,eta_pcs,coord_fpc_Apsi,coord_fpc_BOmega)
+beta_est <- res[[1]]
+gamma_est <- res[[2]]
+```
+
+```{r}
+
+beta_est_fd<-fd(beta_est,splinebasisA)
+plot(beta_est_fd, main = "Estimación de Beta")
+plot(beta_fd, main = "Beta Verdadera")
+```
+
+
+```{r}
+
+persp(t_vals, s_vals, gamma_ts,
+      theta = 40, phi = 40,      # ángulos de vista
+      expand = , col = "lightblue", shade=.4, border=NA, 
+      xlab = "X", ylab = "Y", zlab = "Z", main = "gamma verdadera")
+
+gamma_estimado <- matrix((matThita%*%gamma_est),n,n)
+persp(t_vals, s_vals, gamma_estimado,
+      theta = 40, phi = 40, shade=.4, border=NA,      # ángulos de vista
+      expand = 1, col = "lightblue",
+      xlab = "X", ylab = "Y", zlab = "Z", main = "gamma estimada")
+
+
+
+```
+
+<span style="color:red">problema: Cuando intento tomar las $\nu_{ih}$ coordenadas de la Karhunen-Lo´eve expansion para usarlas como covariables de la regresión logistica, me quedan columnas colineales.</span>
+<span style="color:red">$x_{i}^{2}(t,s) = \sum_{j=1}^{p^2} \nu_{ij} g_{j}(t,s)$.</span>
+
+
+Acá intento hacer lo mismo pero en vez de estimando las FPC con PCA sobre $A\psi,B\Omega$ tomo las funciones principales con una libreria cualquiera.
+
+tengo las coordenadas $\zeta^{(2)}_{ij}$ que son los coef de los armónicos.
+
+intento obtener los $\nu^{(2)}_{ij} $ según $X_i^2(t,s) = \left(\sum_{j=1}^{p}\zeta_{ij}^{(2)} f_{j}(t)\right)\left(\sum_{k=1}^{p}\zeta_{ik}^{(2)} f_{k}(t)\right)$
+Después digo que $X_i^2(t,s) = \sum_{j=1}^{p^2} \nu_{ij}^{(2)} g_{j}(t,s) = \left(\sum_{j=1}^{p}\zeta_{ij}^{(2)} f_{j}(t)\right)\left(\sum_{k=1}^{p}\zeta_{ik}^{(2)} f_{k}(t)\right)$
+si es que 
+$\nu_{ih} = \zeta_{ij}\zeta_{ik} h\in(1,p^2)$ entonces relacionamos a h=1 con i=1,j=1, h=2 con i=1,j=2 ,etc..
+
+Vemos que cuando quiero hacer esto me da que los $\nu$ quedan colineales por que tenemos que $f_j(t)f_i(t) = f_i(t)f_j(t) \rightarrow g(t,s)$
+
+
+```{r}
+nharm <- 2
+FuncA.FPCA <- pca.fd(randFuncA, nharm = nharm)
+
+basis.FPCA <- FuncA.FPCA$harmonics
+
+plot(FuncA.FPCA$harmonics, main = 'primeros funciones principales')
+
+coord.X.basis.FPCA <- FuncA.FPCA$scores
+
+coord.Xquad.basis.FPCA <- array(NA, dim = c(n, (nharm*(nharm+1)/2)))
+for (fila in 1:n) {
+  contador <- 1
+  for(j in 1:nharm){
+    for (k in 1:j) {
+      coord.Xquad.basis.FPCA[fila,contador] <- coord.X.basis.FPCA[fila,j]*coord.X.basis.FPCA[fila,k]
+      contador <- 1 + contador
+    }
+  }
+}
+
+df = data.frame(y=y_resp,zeta=coord.X.basis.FPCA, eta = coord.Xquad.basis.FPCA)
+
+glm_model = glm(y ~ 0 + .,  data = df, family = "binomial")
+coef_estimados <- glm_model$coefficients
+
+corelation_coordxquad<- cor(coord.Xquad.basis.FPCA)
+print(cor(df[,-1]))  # quitamos la variable de respuesta y miramos las correlaciones
+
+summary(glm_model)
+
+beta_est <- basis.FPCA$coefs%*%coef_estimados[1:nharm]
+beta_est_fd<-fd(coef=beta_est,basis= FuncA.FPCA$harmonics$basis)
+plot(beta_est_fd, main = 'beta estimada')
+
+
+basis.FPCA.coefs.gamma <- array(NA, dim = c(p^2, (nharm*(nharm+1)/2)))
+
+for (h in 1:p^2)
+{
+  contador <- 1
+  for(j in 1:nharm)
+  {
+    for (k in 1:j) {
+        indice_h <- mapeo_indices[[h]]
+        f_1 <- basis.FPCA$coefs[indice_h[1],k]
+        f_2 <- basis.FPCA$coefs[indice_h[2],j]
+        basis.FPCA.coefs.gamma[h,contador] <- f_1 * f_2
+        contador <- 1 + contador
+    }
+  }
+}
+
+
+gamma_est <- basis.FPCA.coefs.gamma%*%coef_estimados[(nharm+1): (nharm + (nharm*(nharm+1)/2))] 
+
+#matGeiegenfuctions <-kronecker.prod(eval.fd(t_vals,FuncA.FPCA$harmonics),eval.fd(s_vals,FuncA.FPCA$harmonics)) 
+eval_harmonic_basis_s <-eval.fd(t_vals,FuncA.FPCA$harmonics)
+eval_harmonic_basis_t <- eval.fd(s_vals,FuncA.FPCA$harmonics)
+matGeiegenfuctions <- array(NA, dim = c(n^2, (nharm*(nharm+1)/2)))
+contador_fila <- 1
+for(fila_t in 1:n){
+  for(fila_s in 1:n){
+    contador_columna = 1
+    for(i in 1:nharm){
+      for(j in 1:i){
+        matGeiegenfuctions[contador_fila, contador_columna] <-(eval_harmonic_basis_t[fila_t,i]*eval_harmonic_basis_s[fila_s,j]) + (eval_harmonic_basis_t[fila_t,j]*eval_harmonic_basis_s[fila_s,i])
+        contador_columna = contador_columna + 1
+      }
+    }
+    contador_fila = contador_fila + 1
+  }
+}
+
+
+#aca rompe por que al tener covarialbes colineales en la regresión logistica, devuelve muchos NA y rompe las dimensiones esperadas
+gamma_estimado <- matrix((matGeiegenfuctions%*%gamma_est),n,n)
+
+persp(t_vals, s_vals, matrix((matThita%*%gamma),n,n),
+      theta = 60, phi = 40,      # ángulos de vista
+      expand = 0.5, col = "lightblue",
+      xlab = "X", ylab = "Y", zlab = "Z")
+
+
+```
+
