@@ -1,0 +1,740 @@
+---
+title: "tesis_simulacion_solo_fpca"
+author: "santiago eliges"
+date: "2025-05-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Librerías
+```{r, warning=FALSE, message=FALSE}
+library('fda')        # herramientas para tratar datos funcionales  
+library('robustbase') # lmrob 
+library(fda.usc)      # dataset + herramientas como fda (derivada, por ejemplo)
+library(lattice)      # gráficos
+library(gdata)        # uppertriangle
+library(splines2)
+library(fastmatrix)
+library(spacetime)
+library(sp)
+library(dplyr)
+library(FRK)
+library(matlib)
+library(FactoMineR)
+library(factoextra)
+library(funcharts)
+```
+Para hacer la simulación, primero intento costruir a las funciones aleatorias $X_i$ simulando a la matriz A de coordenadas en la base $\phi$.
+
+Primero, definimos a la base $\phi$ como la base de Bsplines en el intervalo (0,10) con un knot en cada punto del intervalo (términamos teniendo 13 funciones en la base)
+```{r}
+# number of basis functions = order + number of interior knots
+# Bspline por defaul tiene orden 4, 9 interior knots en c(0,10) (knots interiores son sin contar los bordes)
+p<-13
+splinebasisA <- create.bspline.basis(c(0,10),p)
+plot(splinebasisA)
+
+```
+Armamos a la matriz A de 200 individuos con 13 coeficientes que forman su coordenadas en la base. Es decir
+$X_i(t) = \sum_{k=1}^{13} A_{ik}\phi_k(t) \quad \forall i \in (1,200)$.
+Se construye 13 normales diferentes y para cada fila de A, se samplea cada columna a partir de la distribución normal relacionada
+```{r}
+n<-200
+means <- runif(p, min = -0.5, max = 0.5)
+
+stdvs <- runif(p, min = 0, max = 2)
+
+A = matrix(NA, nrow = n, ncol = p)
+for (i in 1:n){
+  for (j in 1:p){
+    A[i,j] <- rnorm(1, mean = means[j], sd = stdvs[j])
+  }
+}
+
+A<-normalizar.superficie(A)
+
+#rand_transformation_matrix <- matrix(runif(p*p,min=0, max = 1), ncol=p, nrow=p)
+
+#random_A <- A #%*% rand_transformation_matrix
+```
+
+Construimos B a partir de A, donde cada fila de B esta dada por $vech(A_i^tA)$
+```{r}
+B = array(NA, dim = c(n, p*(p+1)/2))
+
+for(i in 1:n){
+  contador<-1
+  for(j in 1:p){
+    for (k in 1:j) {
+      B[i,contador] <- (2-(j==k))*A[i,j]*A[i,k]
+      contador <- contador+1
+    }
+  }
+}
+
+B<-normalizar.superficie(B)
+
+```
+
+Construyo las 200 obsevaciones funcionales
+
+```{r}
+randFuncA<-fd(t(A),splinebasisA)
+randFuncA$fdnames <- list("x", "Sample" = range(1,n), "y")
+
+
+media_func <- mean.fd(randFuncA)
+
+# Crear una matriz de coeficientes con la media repetida n veces
+coef_media_rep <- matrix(rep(media_func$coefs, ncol(randFuncA$coefs)),
+                         nrow = nrow(randFuncA$coefs))
+
+# Crear objeto fd con la media replicada
+media_fd_rep <- fd(coef_media_rep, basisobj = randFuncA$basis)
+
+randFuncA <- randFuncA - media_fd_rep
+plot(randFuncA)
+"ab1<-fdata.deriv(randFuncA, nderiv = 1)
+X   <- ab1$data 
+ww <- sqrt(rowSums(X^2))
+ww <- replace(ww, which(ww <= 1e-50), 1e-50)
+xe <- X / ww"
+
+
+```
+
+Defino las funciones parámetricas
+La función esta dada por $\beta(t) = sin(t-\pi/4)$.
+Usamos la función smooth.basis para recuperar las coordenadas $\beta$ en la base $\phi$.
+Esta función de fondo evalua a la base en los valores definidos ($t \in (1,10)$) y construye una matriz que llamamos basismat. Despues, busca con cuadrados minimos (con un término de penalización) los coeficientes $beta$ de la ecuación $Y = eval.basis(\phi(t)) \beta$
+```{r}
+
+t_vals <- seq(0, 10,length.out = n)
+beta_t <- scale(sin(t_vals - pi/4))
+basismat = eval.basis(t_vals, splinebasisA)
+beta_fd_smooth <- smooth.basis(argvals = t_vals, y = beta_t, fdParobj = splinebasisA)
+beta_fd <- beta_fd_smooth$fd
+beta <- beta_fd$coefs
+plot(beta_t, main = "Beta sampleada")
+
+plot(beta_fd, col = "red", main = "beta smootheada")
+
+```
+
+Construyo ala suoperficie simetrica(respecto del eje t=s) y luego busco sos coordenadas en la base.
+
+ Necesito obtener las coordenadas $\gamma_{ij}$ en las bases $\phi(t), \phi(s)$. Para esto paso a buscar las $13(13+1)/2$ coordenadas $\gamma_k$ en la base $\theta$ de $13(13+1)/2$ funciones dadas por $\theta_k = \{\phi_{J(k)_1} (t)\phi_{J(k)_2}(s) + \phi_{J(k)_2} (t)\phi_{J(k)_1} (s):1\leq k \leq p(p+1)/2\}$ donde $J(1) = (1,1), J(2) = (2,1), J(2) = (2,2)\dots,J(p) = (p,1),J(p+1) = (p,2),\dots$. es decir, que hace el triangulo inferior de la matriz de arriba a abajo izquierda a derecha.
+Hago una "implementación a mano" de smooth.basis armando la eval.matrix de la base $\theta$, donde en la fila k estan los valores de $\theta(I(k)_1,I(k)_2)$ donde $I(1) = (1,1), I(2) = (2,1), J(3) = (3,1)\dots,J(p) = (p,1),J(p+1) = (1,2),\dots$
+```{r}
+estimador_superficie_simetrica <- function(gamma_ts, s_vals, t_vals, splinebasis, lambda = 0) {
+  # Evaluación de bases
+  eval_basis_s <- eval.basis(s_vals, splinebasis)
+  eval_basis_t <- eval.basis(t_vals, splinebasis)
+  
+  n <- length(s_vals)
+  p <- ncol(eval_basis_s)  # número de funciones base
+  
+
+  # Vectorizar la matriz gamma_ts
+  y <- as.vector(gamma_ts)
+  X <- kronecker(eval_basis_s, eval_basis_t)  # (n^2 x nbasis^2)
+  
+  # Estimar coeficientes por mínimos cuadrados (opcional regularización)
+  XtX <- t(X) %*% X
+  if (lambda > 0) {
+    XtX <- XtX + lambda * diag(ncol(X))
+  }
+  coeficientes <- solve(XtX, t(X) %*% y)
+
+  # Reconstruir la matriz simétrica de coeficientes
+  coef_matrix <- matrix(coeficientes, nrow = p, ncol = p, byrow = TRUE)
+
+  "coef_matrix <- matrix(0, p, p)
+  contador <- 1
+  for (i in 1:p) {
+    for (j in 1:i) {
+      coef_val <- coeficientes[contador]*2 #/ (2 - (i == j))
+      coef_matrix[i, j] <- coef_val
+      #coef_matrix[j, i] <- coef_val
+      contador <- contador + 1
+    }
+  }"
+
+  # Reconstrucción de la superficie aproximada
+
+  gamma_aprox <- eval_basis_s %*% coef_matrix %*% t(eval_basis_t)
+
+  # Crear bifd opcional
+  bifd_obj <- bifd(coef_matrix, splinebasis, splinebasis)
+
+  return(list(
+    coeficientes = coef_matrix,
+    superficie_aproximada = gamma_aprox,
+    bifd = bifd_obj
+  ))
+}
+
+
+normalizar.superficie <- function(superficie){
+  superficie_mean <- mean(superficie)
+  superficie_centered <- superficie - superficie_mean
+  
+  # Normalización
+  superficie_sd <- sd(as.vector(superficie_centered))
+  superficie_normalized <- superficie_centered / superficie_sd
+  
+  return(superficie_normalized)
+}
+
+
+
+s_vals <- seq(0, 10,length.out = n)
+gamma_ts <- matrix(0, nrow = n, ncol = n)
+for(i in 1:n){
+  for(j in 1:n){
+    t <- t_vals[j]
+    s <- s_vals[i]
+    gamma_ts[i,j] <- t*s
+  }
+}
+
+
+resultado <- estimador_superficie_simetrica(gamma_ts, s_vals, t_vals, splinebasisA,1e-6)
+
+# Acceder a los resultados
+coef <- resultado$coeficientes
+gamma_aprox <- resultado$superficie_aproximada
+gamma_fd <- resultado$bifd
+
+# Visualizar
+persp(t_vals, s_vals, normalizar.superficie(gamma_aprox),theta = 120, phi = 20, shade=.4, border=NA,     # ángulos de vista
+      expand = 0.5, col = "lightblue",ticktype='detailed',
+      xlab = "X", ylab = "Y", zlab = "Z" )
+```
+
+
+
+Armamos la simulación.
+Los psi esta dados por
+$\psi_{ij}  = \int_{T} \phi_{i}(t)\phi_{j}(t) dt$
+Los omega estan dados por
+$\omega_{ij} = \int_{T}\int_{T} \left( \phi_{I(i)_1}(t)\phi_{I(i)_2}(s) + \phi_{I(i)_2}(t)\phi_{I(i)_1}(s)\right) \left(  \phi_{I(j)_1}(t)\phi_{I(j)_2}(s) + \phi_{I(j)_2}(t)\phi_{I(j)_1}(s) \right) dtds$
+```{r}
+psi <- inprod(splinebasisA,splinebasisA)
+
+mapeo_indices <- vector("list", p*p)
+contador <- 1
+for(i in 1:dim(psi)[1]){
+  for(j in 1:dim(psi)[1]){
+    mapeo_indices[[contador]] <- c(i, j)
+    contador <- contador + 1
+  }
+}
+
+
+omega <- array(0, dim = c((p*(p+1)/2), (p*(p+1)/2)))
+for(i in 1:(p*(p+1)/2)){
+  for(j in 1:(p*(p+1)/2)){
+    indices_i_en_phi <- mapeo_indices[[i]]
+    indices_j_en_phi <- mapeo_indices[[j]]
+    omega[i,j] <- 4*psi[indices_i_en_phi[1],indices_j_en_phi[1]]*psi[indices_i_en_phi[2],indices_j_en_phi[2]] +
+      2*psi[indices_i_en_phi[1],indices_j_en_phi[2]]*psi[indices_i_en_phi[2],indices_j_en_phi[1]] +
+      psi[indices_i_en_phi[2],indices_j_en_phi[2]]*psi[indices_i_en_phi[1],indices_j_en_phi[1]]
+  }
+}
+```
+
+Simulamos las variables respuesta con las funciones centradas
+
+```{r}
+
+A.Psi <-A%*%psi 
+B.Omega <- B%*%omega 
+gamma <- matrix(coef[lower.tri(coef, diag = TRUE)], nrow = 91, ncol = 1)
+
+
+C = A.Psi%*%beta + B.Omega%*%gamma
+
+```
+```{r}
+pi =plogis(C) #inv-logit function. Evita NAs
+
+```
+```{r}
+y_resp = rbinom(length(C),1,pi)
+```
+
+Vamos a armar el modelo donde podemos elegir la cantidad de harminicos para el termino lineal y para el termino cuadratico. 
+En el modelo, vamos a usar como covariables los scores de los terminos en sus respectivos harmonicos, de esta forma obtenemos estimaciones de las coordenadas beta y gamma ya que;
+$\int_T\sum_{k=1}^p\beta_k\phi_k(t)\sum_{j=1}^p\xi_j\phi_j(t)dt = \sum_{k,j = 1}^p \beta_k\xi_j\int_T\phi_j(t)\phi_k(t)dt$
+donde $\int_T\phi_j(t)\phi_k(t)dt = 1*(j=k)$
+$\int_T\int_T\sum_{k=1}^{p}\sum_{l=1}^k \gamma_{k,l}\phi_k(t)\phi_l(s)\sum_{j=1}^{p}\xi_j\phi_j(t)\sum_{i=1}^p\xi_i \phi_i(s)dtds = \sum_{k=1}^{p}\sum_{l=1}^k\sum_{i,j=1}^p \gamma_{k,l}\xi_j\xi_i\int_T\int_T\phi_k(t)\phi_l(s)\phi_j(t)\phi_i(s)dtds$
+$=\sum_{k=1}^{p}\sum_{l=1}^k \gamma_{k,l}\xi_k\xi_l = \sum_{k=1}^{p(p+1)/2}\gamma_{k}\kappa_k$
+```{r}
+nharmLineal <- 6#tieneq q ser menor q p
+nharmCuadratico <-6#tiene q ser menor q p
+n <- length(s_vals)
+p <- 13
+
+obtener.scores.FPCA <- function(fdObj,nharmLineal,nharmCuadratico,p){
+  n <- dim(fdObj$coefs)[2]
+  media_func <- mean.fd(fdObj)
+  
+  # Crear una matriz de coeficientes con la media repetida n veces
+  coef_media_rep <- matrix(rep(media_func$coefs, ncol(fdObj$coefs)),
+                           nrow = nrow(fdObj$coefs))
+  # Crear objeto fd con la media replicada
+  media_fd_rep <- fd(coef_media_rep, basisobj = fdObj$basis)
+  # Restar para centrar
+  fdObj.centrado <- fdObj - media_fd_rep
+
+  fdObj.FPCA <- pca.fd(fdObj.centrado,nharm=p)
+  basis.FPCA <- fdObj.FPCA$harmonics
+  
+  plot(fdObj.FPCA$harmonics, main = 'primeros funciones principales')
+  scores <- fdObj.FPCA$scores
+  zeta.termino.lineal.FPCA <- fdObj.FPCA$scores[,1:nharmLineal]
+  
+  eta.termino.cuadratico.FPCA <- array(NA, dim = c(n, (p*(p+1)/2)))
+  #En realidad, solo puedo quearme con los terminos de la diagonal ya que los otros son colineales y no me aportan nada...
+  #nu.termino.cuadratico.FPCA <- array(NA, dim = c(n, p))
+  for (fila in 1:n) {
+        eta.aux <- scores[fila,]%*%t(scores[fila,])
+        eta.termino.cuadratico.FPCA[fila,] <- lowerTriangle(eta.aux, diag=TRUE, byrow=TRUE)
+        #nu.termino.cuadratico.FPCA[fila,] <- diag(nu.aux)
+  }
+  
+  
+  eta.termino.cuadratico.FPCA <- eta.termino.cuadratico.FPCA[,1:(nharmCuadratico*(nharmCuadratico+1)/2)]
+  #nu.termino.cuadratico.FPCA <- nu.termino.cuadratico.FPCA[,1:nharmCuadratico]
+  
+  res <- list(zeta.termino.lineal.FPCA,eta.termino.cuadratico.FPCA,basis.FPCA)
+  return(res)
+}
+
+print(obtener.scores.FPCA(randFuncA,nharmLineal,nharmCuadratico,p))
+
+```
+
+Pongo como covariables a los $\xi, \kappa$ y estimo los valores $\hat\beta, \hat\gamma$
+
+Atención: Acá ya no se si tenemos a las FPCA del término cuadratico en ´rden de más varianza explicada a menos. Podríamos buscar un método que optimice a los scores usados como covarialbes.
+```{r}
+
+obtener.coordenadas.estimadas <-  function(covariables_lineales,covariables_cuadraticas,y_resp,nharmLineal,nharmCuadratico )
+    {
+  
+  df <-data.frame(y=y_resp,xi=covariables_lineales,kappa = covariables_cuadraticas)
+  
+  glm_model = glm(y ~ 0 + .,  data = df, family = "binomial")
+  coef_estimados <- glm_model$coefficients
+  
+  summary(glm_model)
+  
+  xi <- coef_estimados[1:nharmLineal]
+  kappa <- coef_estimados[(nharmLineal+1):(length(coef_estimados))]
+  
+  return(list(xi,kappa,summary(glm_model)))
+}
+
+covariables <- obtener.scores.FPCA(randFuncA,nharmLineal,nharmCuadratico,p)
+#print(obtener.coordenadas.estimadas(covariables[1], covariables[2], 9y_resp,nharmLineal,nharmCuadratico))
+
+```
+Reconstruimos a la función $\beta(t)$ en la base de FPC's notando que $\beta(t) = \sum_{k=1}^p\beta_k \sum_{l=1}^p f_{lk}\phi_l(t) $
+```{r}
+estimar.parametros<-function(xi,nu,basis.FPCA, nharmLineal,nharmCuadratico){
+
+  coef.beta.est <-xi%*%t(basis.FPCA$coefs)[1:nharmLineal,] #al tomar coefs de una basis, siempre te da la matriz transpuesta con tanta cantidad de columnas como de observaciones. Esto no es más que tomar a t(beta)F
+  beta_t <- fd(coef=t(coef.beta.est), basisobj = basis.FPCA$basis, fdnames = basis.FPCA$fdnames) #Denuevo, tengo que transponer a la matriz de coef para armar al objeto funcional
+
+  matriz.gamma <- array(0, dim = c(nharmCuadratico, nharmCuadratico))
+  lowerTriangle(matriz.gamma, diag=TRUE, byrow=TRUE) <- nu
+
+  # Separamos el triang sup (sin diag) y dividimos por 2 para recuperar los estim de u_jl
+  aux <- lowerTriangle(matriz.gamma, diag=FALSE, byrow=TRUE)/2 
+  # Pisamos el triang sup (sin diag) con esos coef
+  upperTriangle(matriz.gamma, diag=FALSE,byrow=FALSE) <- aux 
+  # Rellenamos el triang inf (sin diag) con esos coef
+  lowerTriangle(matriz.gamma, diag=FALSE,byrow=TRUE) <- aux 
+  
+  # Reconstruimos las estimación del operador cuadrático
+  # suma_{i} u_hat[i,i] phi_i(t) phi_i (s)  + 2 suma_{i \ne j} u_hat[i,j] phi_i(t) phi_j (s)
+  # sobre los puntos de la grilla que son los que estan en cov_dec[,i] y cov_dec[,j]
+  # de esa manera de obtiene una matriz de lt*lt 
+  matriz.coef.gamma <- basis.FPCA$coefs[,1:nharmCuadratico]%*%matriz.gamma%*%t(basis.FPCA$coefs)[1:nharmCuadratico,]
+  matriz.coef.gamma  <- (matriz.coef.gamma  + t(matriz.coef.gamma ))/2
+  
+  gamma_st <- bifd(coef = (matriz.coef.gamma), sbasisobj = basis.FPCA$basis, tbasisobj = basis.FPCA$basis)
+  return(list(coef.beta.est,beta_t, matriz.coef.gamma, gamma_st))
+}
+
+basis.fpca<-obtener.scores.FPCA(randFuncA,nharmLineal,nharmCuadratico,p)[3]
+coordenadas.estimadas <- obtener.coordenadas.estimadas(covariables[[1]], covariables[[2]], y_resp,nharmLineal,nharmCuadratico)
+parametros_estimados <- estimar.parametros(coordenadas.estimadas[[1]],coordenadas.estimadas[[2]],basis.fpca[[1]],nharmLineal,nharmCuadratico)
+
+plot(parametros_estimados[[2]])
+
+```
+Reconstruimos a gamma de manera analoga
+```{r}
+
+plotear_estimaciones <- function(t_vals,s_vals,beta_est,gamma_est,beta_real, gamma_real){
+  
+  plot(beta_est)
+  beta_real <- normalizar.superficie(eval.fd(t_vals,beta_real))
+  plot(beta_real)
+  
+
+  
+  gamma_mat <- eval.bifd(t_vals,s_vals,gamma_est)
+
+  persp(t_vals, s_vals, gamma_mat,
+  theta = 120, phi = 40, r=3, expand = 0.5,
+  ticktype='detailed', 
+  shade=.4, border=NA,     # ángulos de vista
+   col = "lightblue")
+
+  gamma_real <- normalizar.superficie(eval.bifd(t_vals,s_vals,gamma_real))
+  persp(t_vals, s_vals, gamma_real,
+  theta = 120, phi = 40, r=3, expand = 0.5,
+  ticktype='detailed', 
+  shade=.4, border=NA,     # ángulos de vista
+   col = "lightblue")
+
+
+}
+
+plotear_estimaciones(t_vals,s_vals, parametros_estimados[[2]], parametros_estimados[[4]],beta_fd, gamma_fd)
+```
+Metrica IMSEB
+```{r}
+ library(pracma)
+IMSEB.fd<- function(funcion_real, funcion_estimada, s_vals, t_vals){
+
+  eval_dif <- normalizar.superficie(eval.fd(t_vals,funcion_real))-normalizar.superficie(eval.fd(t_vals,funcion_estimada))
+  #eval_dif <- eval.fd(t_vals, fd_dif) 
+  #plot(fd_dif)
+
+  integral_t <- trapz(t_vals, eval_dif)
+  
+  cuadrado_producto <- integral_t^2
+  return((1/(funcion_real$basis$rangeval[-1]))*cuadrado_producto)
+}
+
+
+IMSEB.bifd<- function(funcion_real, funcion_estimada, s_vals, t_vals){
+  
+  eval_real <- normalizar.superficie(eval.bifd(s_vals, t_vals, funcion_real))
+  eval_estim <- normalizar.superficie(eval.bifd(s_vals, t_vals, funcion_estimada))
+
+  
+  # Producto punto en cada punto de la grilla
+  diferencia <- eval_real - eval_estim
+
+  # Integración numérica doble (usar trapz dos veces)
+  integral_st <- trapz(s_vals, apply(diferencia, 2, function(col) trapz(t_vals, col)))
+  
+  # Si querés el cuadrado del producto interno:
+  cuadrado_producto <- integral_st^2
+  return((1/(funcion_real$sbasis$rangeval[-1]))*cuadrado_producto)
+}
+
+IMSEB.fd(beta_fd,parametros_estimados[[2]],s_vals, t_vals)
+IMSEB.bifd(gamma_fd,parametros_estimados[[4]], s_vals, t_vals)
+```
+Hago todo esto na función para busqueda de hiperparametros
+```{r}
+fpca.lr.sq.functional <- function(fdObj,nharmLineal,nharmCuadratico,beta_real,gamma_real,y_resp){
+  p<-dim(fdObj$coef)[1]
+  nobs<-dim(fdObj$coef)[2]
+  
+  fpca.res<-obtener.scores.FPCA(fdObj,nharmLineal,nharmCuadratico,p)
+  
+  zeta <- fpca.res[[1]]
+  nu <- fpca.res[[2]]
+  basis.FPCA <- fpca.res[[3]]
+
+  coordenadas.estimadas<-obtener.coordenadas.estimadas(zeta,nu,y_resp,nharmLineal,nharmCuadratico)
+
+  xi<-coordenadas.estimadas[[1]]
+  kappa<-coordenadas.estimadas[[2]]
+  
+  parametros.estimados <- estimar.parametros(xi,kappa,basis.fpca[[1]],nharmLineal,nharmCuadratico)
+  
+  beta.t<-parametros.estimados[[2]]
+  gamma.st <- parametros.estimados[[4]]
+  
+  plotear_estimaciones(t_vals,s_vals, beta.t, gamma.st,beta_real,gamma_real)
+
+  
+  res <- list(IMSEB.fd(beta_real, beta.t,s_vals, t_vals),IMSEB.bifd(gamma_real,gamma.st, s_vals, t_vals))
+  return(res)
+
+}
+
+fpca.lr.sq.functional(randFuncA,4,4,beta_fd,gamma_fd, y_resp)
+
+```
+```{r}
+# Crear lista vacía para almacenar los resultados
+resultados <- vector("list", length = 13)
+
+# Recorrer valores de n del 1 al 13
+for (n in 2:13) {
+  resultados[[n]] <- fpca.lr.sq.functional(randFuncA, n, n, beta_fd, gamma_fd, y_resp)
+}
+
+
+```
+Tomo las PCA de $A\psi, B\Omega$. LLamo $\zeta_i$ la i-esima componete principal de $A\psi$ y $\eta$ la i-esima componete principal de $B\Omega$
+```{r}
+nharm <- 3
+nharmcuad<-nharm*(1+nharm)/2
+
+pca_apsi <- prcomp(A.Psi)
+summary(pca_apsi)
+fviz_screeplot(pca_apsi)
+V <- pca_apsi$rotation[,1:nharm]
+zeta <- A.Psi%*%V
+
+pca_bomega <- prcomp(B.Omega)
+summary(pca_bomega)
+fviz_screeplot(pca_bomega)
+W <- pca_bomega$rotation[,1:nharmcuad]
+eta <- B.Omega%*%W
+```
+Defino la función que dado $Z,H,V,W$ devuelve las coordenadas $\hat\beta,\hat\gamma$ estimadas
+```{r}
+
+lr.fpc <- function(df, zeta_pcs, eta_pcs, V, W){
+  
+  zeta_names <- paste0("zeta.PC", zeta_pcs)
+  eta_names <- paste0("eta.PC", eta_pcs)
+  
+  predictors <- c(eta_names,zeta_names)
+  formula_str <- paste("y ~ 0 +", paste(predictors, collapse = " + "))
+  glm_formula <- as.formula(formula_str)
+  
+  glm_model = glm(glm_formula,  data = df, family = "binomial")
+  coef_estimados <- glm_model$coefficients
+  
+  summary(glm_model)
+  
+  kappa <- coef_estimados[1:length(eta_pcs)]
+  xi <- coef_estimados[(length(eta_pcs)+1):(length(zeta_pcs) + length(eta_pcs))]
+     
+  beta_est <- V[, zeta_pcs] %*% xi
+
+  gamma_est <- W[, eta_pcs] %*% kappa
+  
+  print(summary(glm_model))
+  return(list(beta_est, gamma_est))
+  }
+```
+
+deberíamos ver que $ZV' = A\Psi$ ya que $Z = A\Psi V$ pero no pasa x error numerico asumo
+```{r}
+#zeta%*%t(V) == A%*%psi
+```
+
+Ajusto el modelo tomando las 3 pc's de $A\psi$ y las 20 pc'sde $B\Omega$ como covariables y recupero las estimaciones $\hat\beta, \hat\gamma$
+
+```{r}
+
+df = data.frame(y=y_resp,zeta=zeta,eta = eta)
+zeta_pcs <- c(1:nharm)
+eta_pcs <- c(1:nharmcuad)
+res <- lr.fpc(df,zeta_pcs,eta_pcs,V,W)
+beta_est <- res[[1]]
+gamma_est <- res[[2]]
+
+```
+
+grafico la funcion beta estimada y comparo con la verdadera
+```{r}
+
+beta_est_fd<-fd(beta_est,splinebasisA)
+plot(beta_est_fd, main = "Estimación de Beta")
+plot(beta_fd, main = "Beta Verdadera")
+```
+grafico la función gamma estimada y comparo con la verdadera
+
+```{r}
+
+matriz_gamma <- array(0, dim = c(p, p))
+
+# Completamos el triang sup y la diagonal con los estimados de v_jl
+upperTriangle(matriz_gamma, diag=TRUE, byrow=TRUE) <- gamma_est 
+# Separamos el triang sup (sin diag) y dividimos por 2 para recuperar los estim de u_jl
+aux <- upperTriangle(matriz_gamma, diag=FALSE, byrow=TRUE)/2 
+# Pisamos el triang sup (sin diag) con esos coef
+upperTriangle(matriz_gamma, diag=FALSE,byrow=TRUE) <- aux 
+# Rellenamos el triang inf (sin diag) con esos coef
+lowerTriangle(matriz_gamma, diag=FALSE,byrow=FALSE) <- aux 
+# Visualizar
+
+matriz_gamma <-matriz_gamma
+matriz_gamma_est <- (matriz_gamma + t(matriz_gamma))/2
+
+persp(t_vals, s_vals, gamma_aprox,theta = 120, phi = 40, shade=.4, border=NA,     # ángulos de vista
+      expand = 0.5, col = "lightblue",ticktype='detailed',
+      xlab = "X", ylab = "Y", zlab = "Z" )
+
+persp(t_vals, s_vals, eval_basis_t%*%matriz_gamma%*%t(eval_basis_s),
+      theta = 120, phi = 40, shade=.4, border=NA,      # ángulos de vista
+      expand = 1, col = "lightblue",ticktype='detailed',
+      xlab = "X", ylab = "Y", zlab = "Z", main = "gamma estimada",zlim =c(-1,7))
+
+
+
+```
+
+```{r}
+
+elementos.del.modelo <- function(fdObj,n,p){
+  basis <- fdObj$basis
+  A <- t(fdObj$coef)
+  Psi <- inprod(basis,basis)
+  
+  B = array(NA, dim = c(n, p*(p+1)/2))
+  for(i in 1:n){
+    contador<-1
+    for(j in 1:p){
+      for (k in 1:j) {
+        B[i,contador] <- (2-(j==k))*A[i,j]*A[i,k]
+        contador <- contador+1
+      }
+    }
+  }
+  
+  mapeo_indices <- vector("list", p*p)
+  contador <- 1
+  for(i in 1:dim(Psi)[1]){
+    for(j in 1:dim(Psi)[1]){
+      mapeo_indices[[contador]] <- c(i, j)
+      contador <- contador + 1
+    }
+  }
+  
+  
+  Omega <- array(0, dim = c((p*(p+1)/2), (p*(p+1)/2)))
+  for(i in 1:(p*(p+1)/2)){
+    for(j in 1:(p*(p+1)/2)){
+      indices_i_en_phi <- mapeo_indices[[i]]
+      indices_j_en_phi <- mapeo_indices[[j]]
+      Omega[i,j] <- Psi[indices_i_en_phi[1],indices_j_en_phi[1]]*Psi[indices_i_en_phi[2],indices_j_en_phi[2]] +
+        2*Psi[indices_i_en_phi[1],indices_j_en_phi[2]]*Psi[indices_i_en_phi[2],indices_j_en_phi[1]] +
+        Psi[indices_i_en_phi[2],indices_j_en_phi[2]]*Psi[indices_i_en_phi[1],indices_j_en_phi[1]]
+    }
+  }
+  return(list(A,B,Psi,Omega))
+}
+
+pca.de.regresion <- function(A,B,Psi,Omega,nharmLineal,nharmCuadratico){
+  
+  A.Psi <-A%*%psi
+  pca_apsi <- prcomp(A.Psi)
+  summary(pca_apsi)
+  fviz_screeplot(pca_apsi)
+  V <- pca_apsi$rotation[,1:nharmLineal]
+  zeta <- A.Psi%*%V
+  
+  B.Omega <- B%*%omega
+  pca_bomega <- prcomp(B.Omega)
+  summary(pca_bomega)
+  fviz_screeplot(pca_bomega)
+  W <- pca_bomega$rotation[,1:nharmCuadratico]
+  eta <- B.Omega%*%W
+  
+  return(list(zeta,V,eta,W))
+}
+
+obtener.estimaciones <- function(y_resp,zeta,eta,V,W,nharmLineal,nharmCuadratico,basis){
+    
+  df = data.frame(y=y_resp,zeta=zeta,eta = eta)
+  zeta_pcs <- c(1:nharmLineal)
+  eta_pcs <- c(1:nharmCuadratico)
+  res <- lr.fpc(df,zeta_pcs,eta_pcs,V,W)
+  beta_est <- res[[1]]
+  gamma_est <- res[[2]]
+  
+  beta_est_fd<-fd(beta_est,basis)
+  
+  matriz_gamma <- array(0, dim = c(p, p))
+  
+  # Completamos el triang sup y la diagonal con los estimados de v_jl
+  upperTriangle(matriz_gamma, diag=TRUE, byrow=TRUE) <- gamma_est 
+  # Separamos el triang sup (sin diag) y dividimos por 2 para recuperar los estim de u_jl
+  aux <- upperTriangle(matriz_gamma, diag=FALSE, byrow=TRUE)/2 
+  # Pisamos el triang sup (sin diag) con esos coef
+  upperTriangle(matriz_gamma, diag=FALSE,byrow=TRUE) <- aux 
+  # Rellenamos el triang inf (sin diag) con esos coef
+  lowerTriangle(matriz_gamma, diag=FALSE,byrow=FALSE) <- aux 
+  # Visualizar
+  
+  matriz_gamma <-matriz_gamma
+  matriz_gamma_est <- (matriz_gamma + t(matriz_gamma))/2
+  
+  gamma.est.fd <- bifd(matriz_gamma, sbasisobj = basis, tbasisobj = basis)
+  
+  return(list(beta_est_fd,gamma.est.fd))
+}
+
+lr.sq.functional <- function(fdObj,nharmLineal,nharmCuadratico,beta_real,gamma_real){
+  n<-dim(fdObj$coef)[2]
+  basis <- fdObj$basis
+  s_vals <- seq(fdObj$basis$params[1], fdObj$basis$params[length(fdObj$basis$params)]+1,length.out = n)
+  t_vals <- seq(fdObj$basis$params[1], fdObj$basis$params[length(fdObj$basis$params)]+1,length.out = n)
+  p <- basis$nbasis
+  
+  elementos<-elementos.del.modelo(fdObj,n,p)
+  A <-elementos[[1]]
+  B <-elementos[[2]]
+  psi <-elementos[[3]]
+  omega <-elementos[[4]]
+  
+  covarialbes <- pca.de.regresion(A,B,Psi,Omega,nharmLineal,nharmCuadratico)
+  zeta <-covarialbes[[1]]
+  V <- covarialbes[[2]]
+  eta <- covarialbes[[3]]
+  W <- covarialbes[[4]]
+  
+  estimaciones <- obtener.estimaciones(y_resp,zeta,eta,V,W,nharmLineal,nharmCuadratico, basis)
+  beta.est.fd <- estimaciones[[1]]
+  gamma.est.fd <- estimaciones[[2]]
+  
+  
+  plot(beta.est.fd, main = "Estimación de Beta")
+  plot(beta_real, main = "Beta Verdadera")  
+  
+  persp(t_vals, s_vals, normalizar.superficie(eval.bifd(s_vals,t_vals,gamma_real)),theta = 120, phi = 40, shade=.4, border=NA,     # ángulos de vista
+        expand = 0.5, col = "lightblue",ticktype='detailed',
+        xlab = "X", ylab = "Y", zlab = "Z" )
+  
+  persp(t_vals, s_vals, normalizar.superficie(eval.bifd(s_vals,t_vals,gamma.est.fd)),
+        theta = 120, phi = 40, shade=.4, border=NA,      # ángulos de vista
+        expand = 1, col = "lightblue",ticktype='detailed',
+        xlab = "X", ylab = "Y", zlab = "Z", main = "gamma estimada")
+  
+  res <- list(IMSEB.fd(beta_real, beta.est.fd,s_vals, t_vals),IMSEB.bifd(gamma_real,gamma.est.fd, s_vals, t_vals))
+  return(res)
+}
+
+lr.sq.functional(randFuncA,3,6,beta_fd,gamma_fd)
+
+```
+```{r}
+# Crear lista vacía para almacenar los resultados
+resultados <- vector("list", length = 13)
+
+# Recorrer valores de n del 1 al 13
+for (n in 2:13) {
+  resultados[[n]] <- lr.sq.functional(randFuncA, n, n*(n+1)/2, beta_fd, gamma_fd)
+}
+
+```
+
