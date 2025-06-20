@@ -1,0 +1,1048 @@
+
+---
+title: "probando fda"
+author: "santiago eliges"
+date: "2025-04-01"
+output:
+  html_document: default
+  pdf_document: default
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Librerías
+
+```{r, warning=FALSE, message=FALSE}
+library('fda')        # herramientas para tratar datos funcionales  
+library('robustbase') # lmrob 
+library(fda.usc)      # dataset + herramientas como fda (derivada, por ejemplo)
+library(lattice)      # gráficos
+library(gdata)        # uppertriangle
+library(splines2)
+library(fastmatrix)
+library(spacetime)
+library(sp)
+library(dplyr)
+library(FRK)
+library(matlib)
+library(FactoMineR)
+library(factoextra)
+library(funcharts)
+library(pROC)
+```
+
+```{r}
+
+producto_interno_bases <- function(base1, base2 = NULL, a = 0, b = 1) {
+  # Validaciones
+  if (!is.matrix(base1)) stop("base1 debe ser una matriz")
+  m <- nrow(base1)
+  if (is.null(base2)) base2 <- base1
+  if (nrow(base2) != m) stop("base1 y base2 deben tener el mismo número de filas (puntos de la grilla)")
+  
+  # Paso de cuadratura trapezoidal
+  h <- (b - a) / (m - 1)
+  w <- rep(h, m)
+  w[1] <- h / 2
+  w[m] <- h / 2
+  W <- diag(w)
+  
+  # Producto interno entre bases
+  t(base1) %*% W %*% base2
+}
+
+```
+
+
+
+Para hacer la simulación, primero intento costruir a las funciones
+aleatorias $X_i$ simulando a la matriz A de coordenadas en la base
+$\phi$.
+
+Primero, definimos a la base $\phi$ como la base de Bsplines en el
+intervalo (0,10) con un knot en cada punto del intervalo (términamos
+teniendo 13 funciones en la base).
+
+**[DP: OK, generás 200 curvas en (0,10) usando Bsplines. En el script
+que dejo en la carpeta te propongo otra generación, pero esta también
+está OK. Lo bueno es que todo en L2 es "llevable" al (0,1) así que, por
+cuestiones de normalización (¿ponele?), mejor trabajamos ahí, ¿te
+parece?]**
+
+```{r}
+FPCA_empirica<- function(matriz_densa, Delta_t){
+    n <- nrow(matriz_densa)
+    # 6) FPCA empírica (densa)
+    mu_hat     <- colMeans(matriz_densa)
+    X_centered <- sweep(matriz_densa, 2, mu_hat, "-")
+    C_hat      <- (t(X_centered) %*% X_centered) / n
+    #C_hat <- (t(X_centered) %*% X_centered) * (Delta_t / n) #--> Siempre me genera duda estar comiéndome un delta, REVISARLO
+    eig_C      <- eigen(C_hat, symmetric = TRUE)
+    # a) extraer valores propios y ordenarlos
+    eigvals    <- eig_C$values
+    idx        <- order(eigvals, decreasing = TRUE)
+    eigvals    <- eigvals[idx]
+    # b) extraer autofunciones empíricas ordenadas
+    phi_hat    <- eig_C$vectors[, idx, drop = FALSE]  # M × K_true
+    Xi_hat     <- X_centered %*% phi_hat * Delta_t     # n × K_true
+    return(list(eigvals, phi_hat, Xi_hat))
+    }
+```
+
+
+```{r}
+# 1. Simular -------------------------------------------------------------------
+simulate_fpca_data <- function(n, M, beta_coef, gamma_coef, lambda_fun = function(k) k^(-2)) {
+  t_grid   <- seq(0, 1, length.out = M)
+  Delta_t  <- t_grid[2] - t_grid[1]
+  K_true   <- length(beta_coef)
+  lambda_k <- lambda_fun(1:K_true)
+  
+  # 1) Base verdadera (sinusoidal ortonormal en [0,1])
+  Phi_true <- matrix(0, nrow = M, ncol = K_true)
+  for (k in 1:K_true) {
+    Phi_true[, k] <- sqrt(2) * sin((k - 0.5) * pi * t_grid)
+  }
+  
+  #splinebasis <- create.bspline.basis(c(0,1),K_true)
+  #Phi_true <- eval.basis(basisobj = splinebasis, evalarg = t_grid)
+  
+  # 2) Simular scores Xi_true ~ N(0, lambda_k)
+  Xi_true <- matrix(rnorm(n * K_true, mean = 0, sd = sqrt(lambda_k)),
+                    nrow = n, ncol = K_true, byrow = TRUE)
+  
+  # 3) Construir curvas "densas" X_mat = Xi_true %*% t(Phi_true)
+  X_mat <- Xi_true %*% t(Phi_true)
+  
+  # 4) Predictor lineal + cuadrático verdaderos
+  Lin_part  <- Xi_true %*% beta_coef
+  Quad_part <- rep(0, n)
+  mat_idx   <- matrix(seq_len(K_true^2), nrow = K_true, ncol = K_true)
+  combos    <- which(row(mat_idx) <= col(mat_idx), arr.ind = TRUE)
+  for (m in seq_len(nrow(combos))) {
+    j <- combos[m, 1]
+    k <- combos[m, 2]
+    coef_q <- gamma_coef[j, k] * (2 - ifelse(j == k, 1, 0))
+    Quad_part <- Quad_part + coef_q * (Xi_true[, j] * Xi_true[, k])
+  }
+  eta_true <- Lin_part + Quad_part
+  
+  # 5) Simular Y_obs ~ Bernoulli(sigmoide(η_i))
+  prob_true <- exp(eta_true) / (1 + exp(eta_true))
+  Y_obs     <- rbinom(n, size = 1, prob = prob_true)
+  
+  # 6) FPCA empírica (densa)
+  FPCA_empirica_densa <- FPCA_empirica(X_mat, Delta_t)
+  eigvals <- FPCA_empirica_densa[[1]]
+  phi_hat <- FPCA_empirica_densa[[2]]
+  Xi_hat <- FPCA_empirica_densa[[3]]
+  
+  
+  # 7) Reconstruir β_true(t) en la malla
+  beta_true <- Phi_true[, 1:K_true] %*% beta_coef[1:K_true]
+  
+  # 8) Reconstruir γ_true(s,t) en la malla
+  gamma_true <- matrix(0, nrow = M, ncol = M)
+  for (m in seq_len(nrow(combos))) {
+    j      <- combos[m, 1]
+    k      <- combos[m, 2]
+    coef_t <- gamma_coef[j, k] * (2 - ifelse(j == k, 1, 0))
+    gamma_true <- gamma_true +
+      coef_t * (Phi_true[, j] %o% Phi_true[, k])
+    if (j != k) {
+      gamma_true <- gamma_true +
+        coef_t * (Phi_true[, k] %o% Phi_true[, j])
+    }
+  }
+  
+  # 9) Devolver todo
+  return(list(
+    t_grid     = t_grid,
+    Delta_t    = Delta_t,
+    K_true     = K_true,
+    Phi_true   = Phi_true,
+    Xi_true    = Xi_true,
+    X_mat      = X_mat,
+    Y_obs      = Y_obs,
+    eigvals    = eigvals, 
+    phi_hat    = phi_hat,
+    Xi_hat     = Xi_hat,
+    beta_true  = beta_true,
+    gamma_true = gamma_true
+  ))
+}
+```
+
+
+```{r}
+library(glmnet)
+
+fit_models_FPCA_regression <- function(X, Y, t_grid, var_threshold, alpha, crossValglmnet = FALSE,                        variableSelectionMethod = c("none", "AIC", "LRT")
+) {
+    variableSelectionMethod <- match.arg(variableSelectionMethod)
+  
+  n        <- nrow(X)
+  Delta_t  <- t_grid[2] - t_grid[1]
+  
+  
+  FPCA_empirica_densa <- FPCA_empirica(X, Delta_t)
+  eigvals <- FPCA_empirica_densa[[1]]
+  phi_hat <- FPCA_empirica_densa[[2]]
+  Xi_hat <- FPCA_empirica_densa[[3]]
+  
+  cum_var <- cumsum(eigvals) / sum(eigvals)
+  p        <- which(cum_var >= var_threshold)[1]
+
+  mat_idx  <- matrix(seq_len(p^2), nrow = p, ncol = p)
+  combos_p <- which(row(mat_idx) <= col(mat_idx), arr.ind = TRUE)
+  
+  
+  Z_lin <- Xi_hat[, 1:p, drop = FALSE]
+  
+  Z_quad <- matrix(0, nrow = n, ncol = nrow(combos_p))
+  for (m in seq_len(nrow(combos_p))) {
+    j <- combos_p[m, 1]
+    k <- combos_p[m, 2]
+    Z_quad[, m] <- Xi_hat[, j] * Xi_hat[, k]
+  }
+
+  # Estandarización
+  sd_lin       <- apply(Z_lin, 2, sd)
+  Z_lin_scaled <- scale(Z_lin)
+  
+  Z_all        <- cbind(Z_lin, Z_quad)
+  sds_all      <- apply(Z_all, 2, sd)
+  Z_all_scaled <- scale(Z_all)
+
+"  # Sin escalamiento
+sd_lin       <- rep(1, ncol(Z_lin))
+Z_lin_scaled <- Z_lin  # No se escala
+
+Z_all        <- cbind(Z_lin, Z_quad)
+sds_all      <- rep(1, ncol(Z_all))
+Z_all_scaled <- Z_all  # No se escala"
+
+  # Modelos LASSO
+  if (crossValglmnet) {
+      Z_lin_scaled <- as.matrix(Z_lin_scaled)
+      Z_all_scaled <- as.matrix(Z_all_scaled)
+      fit_lin <- cv.glmnet(Z_lin_scaled, Y, family = "binomial", alpha = alpha)
+      fit_quad <- cv.glmnet(Z_all_scaled, Y, family = "binomial", alpha = alpha)
+  }
+  else{
+    Z_lin_df <- as.data.frame(Z_lin_scaled)
+    names(Z_lin_df) <- paste0("Z_lin", seq_len(ncol(Z_lin_df)))
+    
+    Z_all_df <- as.data.frame(Z_all_scaled)
+    names(Z_all_df) <- paste0("Z_all", seq_len(ncol(Z_all_df)))
+    
+    fit_lin <- glm(Y ~ ., data = Z_lin_df, family = binomial)
+    fit_quad <- glm(Y ~ ., data = Z_all_df, family = binomial)
+  }
+  if (!crossValglmnet && variableSelectionMethod != "none") {
+    if (variableSelectionMethod == "AIC") {
+      fit_lin <- step(fit_lin, direction = "forward", test = "AIC")
+      fit_quad <- step(fit_quad, direction = "forward", test = "AIC")
+    } else if (variableSelectionMethod == "LRT") {
+      fit_lin <- step(fit_lin, direction = "forward", test = "LRT")
+      fit_quad <- step(fit_quad, direction = "forward", test = "LRT")
+    }
+  }
+ return(list(
+    fit_lin      = fit_lin,
+    fit_quad     = fit_quad,
+    Z_lin_scaled = Z_lin_scaled,
+    Z_all_scaled = Z_all_scaled,
+    sd_lin       = sd_lin,
+    sds_all      = sds_all,
+    combos_p     = combos_p,
+    p            = p,
+    phi_hat      = phi_hat
+  ))
+}
+
+```
+
+
+```{r}
+# 3. Función: reconstruir β_hat y γ_hat ----------------------------------------
+reconstruct_functions <- function(phi_hat, p, fit_lin, fit_quad, sd_lin, sds_all, combos_p) {
+  M <- nrow(phi_hat)
+  
+  b_scaled_lin   <- coef(fit_lin)[2:(p+1)]
+  b_unscaled_lin <- b_scaled_lin / sd_lin
+  beta_hat_lin   <- phi_hat[, 1:p] %*% b_unscaled_lin
+  
+  coef_scaled_quad <- coef(fit_quad)[-1]
+  b_scaled_quad    <- coef_scaled_quad[1:p]
+  a_scaled_quad    <- coef_scaled_quad[(p+1):length(coef_scaled_quad)]
+  b_unscaled_quad  <- b_scaled_quad / sds_all[1:p]
+  a_unscaled_quad  <- a_scaled_quad / sds_all[(p+1):length(sds_all)]
+  beta_hat_quad    <- phi_hat[, 1:p] %*% b_unscaled_quad
+  
+  gamma_hat_quad <- matrix(0, nrow = M, ncol = M)
+  for (m in seq_len(nrow(combos_p))) {
+    j      <- combos_p[m, 1]
+    k      <- combos_p[m, 2]
+    coef_q <- a_unscaled_quad[m] / (2 - ifelse(j == k, 1, 0))
+    gamma_hat_quad <- gamma_hat_quad +
+      coef_q * (phi_hat[, j] %o% phi_hat[, k])
+    if (j != k) {
+      gamma_hat_quad <- gamma_hat_quad +
+        coef_q * (phi_hat[, k] %o% phi_hat[, j])
+    }
+  }
+  
+  gamma_hat_lin <- matrix(0, nrow = M, ncol = M)
+  
+  return(list(
+    beta_hat_lin   = beta_hat_lin,
+    beta_hat_quad  = beta_hat_quad,
+    gamma_hat_lin  = gamma_hat_lin,
+    gamma_hat_quad = gamma_hat_quad
+  ))
+}
+
+# 4. Graficar (con poda al 90% interior) y evaluar métricas --------------------
+# 4.1. Graficar β(t) en interior: podar 5% en cada extremo
+plot_beta_interior <- function(t_grid, beta_true, beta_hat_lin, beta_hat_quad, title_suffix = "") {
+  # Definir índices interiores
+  interior_idx <- which(t_grid >= 0.05 & t_grid <= 0.95)
+  t_int        <- t_grid[interior_idx]
+  df_beta <- data.frame(
+    t       = t_int,
+    True    = beta_true[interior_idx],
+    EstLin  = beta_hat_lin[interior_idx],
+    EstQuad = beta_hat_quad[interior_idx]
+  )
+  df_beta_long <- reshape2::melt(df_beta, id.vars = "t",
+                                 variable.name = "Modelo",
+                                 value.name = "beta")
+  
+  p <- ggplot(df_beta_long, aes(x = t, y = beta, color = Modelo, linetype = Modelo)) +
+    geom_line(size = 1) +
+    scale_color_manual(values = c("black", "blue", "red")) +
+    scale_linetype_manual(values = c("solid", "dashed", "twodash")) +
+    labs(x = "t", y = expression(beta(t)),
+         title = paste0("β(t) – 90% interior – ", title_suffix)) +
+    theme_minimal() +
+    theme(legend.position = "bottom",
+          legend.title = element_blank(),
+          plot.title = element_text(hjust = 0.5))
+  
+  print(p)
+}
+
+# 4.2. Graficar γ(s,t) con contour en interior (podar bordes)
+plot_gamma_contour_interior <- function(t_grid, gamma_true, gamma_hat_lin, gamma_hat_quad, title_suffix = "") {
+  # Identificar índices interiores
+  interior_idx <- which(t_grid >= 0.05 & t_grid <= 0.95)
+  
+  # Recortar las matrices gamma a interior_idx × interior_idx
+  gt_int_ll <- gamma_true[interior_idx, interior_idx, drop = FALSE]
+  gl_int_ll <- gamma_hat_lin[interior_idx, interior_idx, drop = FALSE]
+  gq_int_ll <- gamma_hat_quad[interior_idx, interior_idx, drop = FALSE]
+  t_int     <- t_grid[interior_idx]
+  
+  prep_gamma <- function(mat, tipo) {
+    df <- reshape2::melt(mat)
+    colnames(df) <- c("s_idx", "t_idx", "gamma")
+    df$Tipo <- tipo
+    df$s    <- t_int[df$s_idx]
+    df$t    <- t_int[df$t_idx]
+    return(df)
+  }
+  
+  df_gamma_true <- prep_gamma(gt_int_ll, paste0("True – ", title_suffix))
+  df_gamma_lin  <- prep_gamma(gl_int_ll, paste0("Est. Lin. – ", title_suffix))
+  df_gamma_quad <- prep_gamma(gq_int_ll, paste0("Est. Quad. – ", title_suffix))
+  df_gamma_all  <- rbind(df_gamma_true, df_gamma_lin, df_gamma_quad)
+  
+  p <- ggplot(df_gamma_all, aes(x = t, y = s, z = gamma)) +
+    geom_contour_filled(aes(fill = ..level..), bins = 20) +
+    facet_wrap(~ Tipo, nrow = 1) +
+    scale_fill_viridis_d(option = "plasma", name = expression(gamma(s, t))) +
+    labs(x = "t", y = "s", title = paste0("Contour γ(s,t) – 90% interior – ", title_suffix)) +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5),
+          strip.text = element_text(size = 10),
+          axis.text  = element_text(size = 6),
+          axis.title = element_text(size = 8))
+  
+  print(p)
+}
+
+plot_gamma_3d_interior <- function(t_grid, gamma_true, gamma_hat_quad, title_suffix = "") {
+  # Encontrar índices interiores
+  interior_idx <- which(t_grid >= 0.05 & t_grid <= 0.95)
+  t_int        <- t_grid[interior_idx]
+  
+  # Recortar matrices
+  gt_int <- gamma_true[interior_idx, interior_idx, drop = FALSE]
+  gq_int <- gamma_hat_quad[interior_idx, interior_idx, drop = FALSE]
+  
+  theta   <- 30
+  phi_ang <- 30
+  col_t   <- "lightblue"
+  col_q   <- "lightcoral"
+  
+  # Calcular zmin y zmax combinados para las dos submatrices
+  zmin <- min(c(gt_int, gq_int), na.rm = TRUE)
+  zmax <- max(c(gt_int, gq_int), na.rm = TRUE)
+  if (abs(zmax - zmin) < 1e-8) {
+    zmin <- zmin - 1e-6
+    zmax <- zmax + 1e-6
+  }
+  
+  op <- par(mfrow = c(1, 2), mar = c(3, 3, 3, 1))
+  
+  persp(x      = t_int,
+        y      = t_int,
+        z      = gt_int,
+        theta  = theta,
+        phi    = phi_ang,
+        expand = 1,
+        col    = col_t,
+        zlim   = c(zmin, zmax),
+        ticktype = "detailed",
+        xlab   = "t",
+        ylab   = "s",
+        zlab   = expression(gamma(s, t)),
+        main   = paste0("γ_true – 90% interior – ", title_suffix),
+        cex.main = 1.1, cex.lab = 0.9, cex.axis = 0.7)
+  
+  persp(x      = t_int,
+        y      = t_int,
+        z      = gq_int,
+        theta  = theta,
+        phi    = phi_ang,
+        expand = 1,
+        col    = col_q,
+        zlim   = c(zmin, zmax),
+        ticktype = "detailed",
+        xlab   = "t",
+        ylab   = "s",
+        zlab   = expression(hat(gamma)(s, t)),
+        main   = paste0("γ_hat_quad – 90% interior – ", title_suffix),
+        cex.main = 1.1, cex.lab = 0.9, cex.axis = 0.7)
+  
+  par(op)
+}
+
+
+# 4.4. Matriz de confusión y CCR
+calculate_confusion <- function(y_true, y_pred) {
+  TP  <- sum(y_true == 1 & y_pred == 1)
+  TN  <- sum(y_true == 0 & y_pred == 0)
+  FP  <- sum(y_true == 0 & y_pred == 1)
+  FN  <- sum(y_true == 1 & y_pred == 0)
+  CCR <- (TP + TN) / length(y_true)
+  return(list(TN = TN, FP = FP, FN = FN, TP = TP, CCR = CCR))
+}
+
+```
+
+
+```{r}
+
+# 4.5. Métricas: matriz de confusión, CCR, ROC y AUC
+compute_metrics <- function(fit_lin, fit_quad, Y_val, Z_lin_scaled, Z_all_scaled,
+                            crossValglmnet, plot_rocs = TRUE) {
+  if (crossValglmnet) {
+    prob_lin   <- predict(fit_lin, newx = Z_lin_scaled, type = "response", s = "lambda.min")
+    prob_quad  <- predict(fit_quad, newx = Z_all_scaled, type = "response", s = "lambda.min")
+  } else {
+    Z_lin_val_df <- as.data.frame(Z_lin_scaled)
+    names(Z_lin_val_df) <- paste0("Z_lin", seq_len(ncol(Z_lin_val_df)))
+    
+    Z_all_val_df <- as.data.frame(Z_all_scaled)
+    names(Z_all_val_df) <- paste0("Z_all", seq_len(ncol(Z_all_val_df)))
+    
+    prob_lin <- predict(fit_lin, newdata = Z_lin_val_df, type = "response")
+    prob_quad <- predict(fit_quad, newdata = Z_all_val_df, type = "response")
+  }
+  
+  pred_lin  <- ifelse(prob_lin > 0.5, 1, 0)
+  pred_quad <- ifelse(prob_quad > 0.5, 1, 0)
+  
+  res_lin   <- calculate_confusion(Y_val, pred_lin)
+  res_quad  <- calculate_confusion(Y_val, pred_quad)
+  
+  roc_lin   <- roc(response = Y_val, predictor = as.vector(prob_lin))
+  roc_quad  <- roc(response = Y_val, predictor = as.vector(prob_quad))
+  
+  auc_lin   <- auc(roc_lin)
+  auc_quad  <- auc(roc_quad)
+  
+  if (plot_rocs) {
+    plot(roc_lin,  col = "blue", lwd = 2,
+         main = "Curva ROC Validación",
+         legacy.axes = TRUE)
+    lines(roc_quad, col = "red", lwd = 2)
+    abline(a = 0, b = 1, lty = 3, col = "gray40")
+    legend("bottomright",
+           legend = c(
+             sprintf("Lineal  (AUC = %.3f)", auc_lin),
+             sprintf("Cuadrático (AUC = %.3f)", auc_quad)
+           ),
+           col  = c("blue", "red"),
+           lwd  = 2,
+           bty  = "n")
+  }
+  
+  return(list(
+    confusion_lin   = res_lin,
+    confusion_quad  = res_quad,
+    auc_lin         = auc_lin,
+    auc_quad        = auc_quad,
+    roc_lin         = roc_lin,
+    roc_quad        = roc_quad
+  ))
+}
+```
+
+```{r}
+
+ajustar_y_graficar_modelos_FPCA_regression <- function(X,
+                                                       Y,
+                                                       t_grid,
+                                                       beta_true,
+                                                       gamma_true,
+                                       var_threshold = 0.70, 
+                                       alpha = 0,
+                                       crossValglmnet = FALSE,
+                                       variableSelection = "LRT",
+                                       scenario_name = "Escenario",
+                                       plot_results = TRUE) {
+  # 5.3. Ajustar modelos lineal y cuadrático
+  fits <- fit_models_FPCA_regression(
+    X                 = X,
+    Y                 = Y,
+    t_grid            = t_grid,
+    var_threshold     = var_threshold,
+    alpha             = alpha,
+    crossValglmnet    = crossValglmnet,
+    variableSelection = variableSelection
+  )
+  
+  fit_lin      <- fits$fit_lin
+  fit_quad     <- fits$fit_quad
+  Z_lin_scaled <- fits$Z_lin_scaled
+  Z_all_scaled <- fits$Z_all_scaled
+  sd_lin       <- fits$sd_lin
+  sds_all      <- fits$sds_all
+  combos_p     <- fits$combos_p
+  p            <- fits$p
+  phi_hat      <- fits$phi_hat
+  
+  # 5.4. Reconstruir funciones estimadas
+  rec <- reconstruct_functions(
+    phi_hat     = phi_hat,
+    p           = p,
+    fit_lin     = fit_lin,
+    fit_quad    = fit_quad,
+    sd_lin      = sd_lin,
+    sds_all     = sds_all,
+    combos_p    = combos_p
+  )
+  
+  beta_hat_lin   <- rec$beta_hat_lin
+  beta_hat_quad  <- rec$beta_hat_quad
+  gamma_hat_lin  <- rec$gamma_hat_lin
+  gamma_hat_quad <- rec$gamma_hat_quad
+
+  # 5.5 y 5.6. Gráficos (si corresponde)
+  if (plot_results) {
+    plot_beta_interior(
+      t_grid        = t_grid,
+      beta_true     = beta_true,
+      beta_hat_lin  = beta_hat_lin,
+      beta_hat_quad = beta_hat_quad,
+      title_suffix  = paste0(scenario_name, " (p=", p, ")")
+    )
+
+    plot_gamma_contour_interior(
+      t_grid         = t_grid,
+      gamma_true     = gamma_true,
+      gamma_hat_lin  = gamma_hat_lin,
+      gamma_hat_quad = gamma_hat_quad,
+      title_suffix   = paste0(scenario_name, " (p=", p, ")")
+    )
+
+    plot_gamma_3d_interior(
+      t_grid         = t_grid,
+      gamma_true     = gamma_true,
+      gamma_hat_quad = gamma_hat_quad,
+      title_suffix   = paste0(scenario_name, " (p=", p, ")")
+    )
+
+    par(mfrow = c(1, 1))  # Reset layout
+  }
+
+  # Devolver resultados incluyendo hiperparámetros usados
+  return(list(
+    fit_lin           = fit_lin,
+    fit_quad          = fit_quad,
+    beta_hat_lin      = beta_hat_lin,
+    beta_hat_quad     = beta_hat_quad,
+    gamma_hat_lin     = gamma_hat_lin,
+    gamma_hat_quad    = gamma_hat_quad,
+    phi_hat           = phi_hat,
+    p                 = p,
+    # Hiperparámetros
+    var_threshold     = var_threshold,
+    alpha             = alpha,
+    crossValglmnet    = crossValglmnet,
+    variableSelection = variableSelection
+  ))
+}
+
+```
+
+```{r}
+
+
+evaluar_modelo_funcional_FPCA_regression <- function(modelo, X, Y, t_grid,plot = FALSE) {
+  Delta_t = t_grid[2] - t_grid[1]
+  FPCA_empirica_densa <- FPCA_empirica(X, Delta_t)
+  eigvals <- FPCA_empirica_densa[[1]]
+  phi_hat <- FPCA_empirica_densa[[2]]
+  Xi_hat <- FPCA_empirica_densa[[3]]
+  
+"  cum_var <- cumsum(eigvals) / sum(eigvals)
+  p        <- which(cum_var >= modelo$var_threshold)[1]"
+  p <- modelo$p
+  mat_idx  <- matrix(seq_len(p^2), nrow = p, ncol = p)
+  combos_p <- which(row(mat_idx) <= col(mat_idx), arr.ind = TRUE)
+  
+  
+  Z_lin <- Xi_hat[,1:p]
+  
+  Z_quad <- matrix(0, nrow = nrow(X), ncol = nrow(combos_p))
+  for (m in seq_len(nrow(combos_p))) {
+    j <- combos_p[m, 1]
+    k <- combos_p[m, 2]
+    Z_quad[, m] <- Xi_hat[, j] * Xi_hat[, k]
+  }
+    # Estandarización
+  sd_lin       <- apply(Z_lin, 2, sd)
+  Z_lin_scaled <- scale(Z_lin)
+  
+  Z_all        <- cbind(Z_lin, Z_quad)
+  sds_all      <- apply(Z_all, 2, sd)
+  Z_all_scaled <- scale(Z_all)
+
+  res <- compute_metrics(
+    fit_lin        = modelo$fit_lin,
+    fit_quad       = modelo$fit_quad,
+    Y_val          = Y,
+    Z_lin_scaled   = Z_lin_scaled,
+    Z_all_scaled   = Z_all_scaled,
+    crossValglmnet = modelo$crossValglmnet,
+    plot_rocs      = plot
+  )
+
+  return(res)
+}
+
+```
+
+```{r}
+
+
+
+simular_datos_funcionales_binarios <- function(n = 200, M = 101, K_true = 10,
+                                               var_threshold = 0.95,
+                                               lambda_fun = function(k) k^-2,
+                                               beta_coef_custom = NULL,
+                                               gamma_coef_custom = NULL) {
+  
+  # 1) Parámetros y base
+  t_grid <- seq(0, 1, length.out = M)
+  Delta_t <- t_grid[2] - t_grid[1]
+  
+  #Bs_basis <- create.bspline.basis(c(0, 1), K_true)
+  #Phi_true <- eval.basis(t_grid, Bs_basis)
+  
+  Phi_true <- matrix(0, nrow = M, ncol = K_true)
+  for (k in 1:K_true) {
+    Phi_true[, k] <- sqrt(2) * sin((k - 0.5) * pi * t_grid)
+  }
+  
+  
+  
+  lambda_k <- lambda_fun(1:K_true)
+  means <- runif(K_true, min = -0.001, max = 0.001)
+  stdvs <- lambda_k
+  
+  # 2) Simular coeficientes A
+  A_true <- matrix(rnorm(n * K_true, mean = rep(means, each = n), sd = rep(stdvs, each = n)),
+                   nrow = n, ncol = K_true)
+  
+  # 3) Producto interno Psi (matriz de Gram de la base)
+  "  Psi_true <- inprod(Bs_basis,
+                     Bs_basis)"
+  Psi_true <- producto_interno_bases(Phi_true)
+  # 4) Escalar A y reconstruir X
+  A_means <- colMeans(A_true)
+  A_sds <- apply(A_true, 2, sd)
+  A_true_scaled <- scale(A_true, center = A_means, scale = A_sds)
+  X_true <- A_true_scaled %*% t(Phi_true)
+  
+  # 5) Construir B_true_scaled para términos cuadráticos
+  B_true_scaled <- matrix(NA, nrow = n, ncol = K_true * (K_true + 1) / 2)
+  contador <- 1
+  for (j in 1:K_true) {
+    for (k in 1:j) {
+      B_true_scaled[, contador] <- (2 - (j == k)) * A_true_scaled[, j] * A_true_scaled[, k]
+      contador <- contador + 1
+    }
+  }
+  
+  # 6) Matriz Omega_true (producto tensorial cuadrático)
+  mat_idx <- matrix(1:(K_true * K_true), nrow = K_true, ncol = K_true)
+  combos <- which(row(mat_idx) >= col(mat_idx), arr.ind = TRUE)
+  combos <- combos[order(combos[, 1], combos[, 2]), ]
+  
+  Omega_true <- matrix(0, nrow = ncol(B_true_scaled), ncol = ncol(B_true_scaled))
+  for (m in 1:nrow(Omega_true)) {
+    for (ñ in 1:ncol(Omega_true)) {
+      i1 <- combos[m, 1]
+      i2 <- combos[m, 2]
+      j1 <- combos[ñ, 1]
+      j2 <- combos[ñ, 2]
+      Omega_true[m, ñ] <- Psi_true[i1, j1] * Psi_true[i2, j2]
+    }
+  }
+  
+  # 7) Predictor lineal + cuadrático
+  gamma_lower_by_row <- gamma_coef_A[lower.tri(gamma_coef_A, diag = TRUE)]
+  Lin_part <- A_true_scaled %*% Psi_true %*% beta_coef_A
+  Quad_part <- B_true_scaled %*% Omega_true %*% gamma_lower_by_row
+  eta_true <- Lin_part + Quad_part
+  
+  # 8) Simulación de respuestas binarias
+  prob_true <- exp(eta_true) / (1 + exp(eta_true))
+  Y_obs <- rbinom(n, size = 1, prob = prob_true)
+  
+  # 9) beta(t)
+  beta_true <- Phi_true %*% beta_coef_custom
+  
+  # 10) gamma(s,t)
+  gamma_true <- matrix(0, nrow = M, ncol = M)
+  for (m in seq_len(nrow(combos))) {
+    j <- combos[m, 1]
+    k <- combos[m, 2]
+    coef_t <- gamma_coef_custom[j, k] * (2 - ifelse(j == k, 1, 0))
+    gamma_true <- gamma_true +
+      coef_t * (Phi_true[, j] %o% Phi_true[, k])
+    if (j != k) {
+      gamma_true <- gamma_true +
+        coef_t * (Phi_true[, k] %o% Phi_true[, j])
+    }
+  }
+  
+  return(list(
+    t_grid = t_grid,
+    Delta_t = Delta_t,
+    K_true = K_true,
+    Phi_true = Phi_true,
+    X_true = X_true,
+    Y_obs = Y_obs,
+    beta_true = beta_true,
+    gamma_true = gamma_true
+  ))
+}
+```
+
+```{r}
+
+# 6. Algunos escenarios --------------------------------------------------------
+#   • A: mezcla de términos cuadráticos e interacción en (1,1),(1,3),(3,5)
+#   • B: solo parte lineal (β ≠ 0, γ = 0)
+#   • C: solo parte cuadrática en (2,2) y (4,4)
+# 6.1. Escenario A: "Lineal y cuadrático"
+"
+K_true <- 16
+
+beta_coef_A <- numeric(K_true)
+beta_coef_A[1:5] <- c(0.1, 0.3,0.33,-1,4)
+
+gamma_coef_A <- matrix(0, nrow = K_true, ncol = K_true)
+gamma_coef_A[1, 1] <- 1.5
+gamma_coef_A[3, 3] <- -0.7
+gamma_coef_A[3, 2] <- 0.3"
+K_true <- 10
+beta_coef_A <- numeric(10)
+beta_coef_A[1] <- 2
+beta_coef_A[2] <- 7.0
+beta_coef_A[9] <- 6.0
+gamma_coef_A <- matrix(0, nrow = 10, ncol = 10)
+gamma_coef_A[1, 1] <- 6.5
+gamma_coef_A[1, 3] <- -2.0
+gamma_coef_A[3, 5] <- 4.0
+
+sim <- simular_datos_funcionales_binarios(gamma_coef_custom = gamma_coef_A,
+                                          beta_coef_custom = beta_coef_A,
+                                          K_true = K_true,
+                                          n = 3000, M=300)
+
+modelo <- ajustar_y_graficar_modelos_FPCA_regression(
+  X = sim$X_true,
+  Y = sim$Y_obs,
+  beta_true = sim$beta_true,
+  t_grid =  sim$t_grid,
+  gamma_true = sim$gamma_true,
+  plot_results  = TRUE )
+
+evaluar_modelo_funcional_FPCA_regression(modelo = modelo, X = sim$X_true, Y = sim$Y_obs, t_grid = sim$t_grid, plot = TRUE)
+
+```
+
+
+```{r}
+grid_search_cv_FPCA_regression <- function(X, Y, t_grid, beta_true, gamma_true,
+                           var_threshold_vals,
+                           variableSelection_vals, crossVal_vals, alpha_vals,
+                           nfolds = 2, seed = 123) {
+
+  set.seed(seed)
+  n <- nrow(X)
+
+  # Dividir en conjunto de entrenamiento y conjunto de test final (20%)
+  idx_total <- 1:n
+  idx_test_final <- sample(idx_total, size = round(0.2 * n))
+  idx_train_total <- setdiff(idx_total, idx_test_final)
+
+  X_train_total <- X[idx_train_total, ]
+  Y_train_total <- Y[idx_train_total]
+  X_test_final <- X[idx_test_final, ]
+  Y_test_final <- Y[idx_test_final]
+
+  # Crear folds de cross-validation sobre el conjunto de entrenamiento
+  folds <- sample(rep(1:nfolds, length.out = length(idx_train_total)))
+
+  resultados_grid <- list()
+  contador <- 1
+
+  for (var_threshold in var_threshold_vals) {
+    for (cv in crossVal_vals) {
+      for (vs in variableSelection_vals) {
+        for (a in alpha_vals) {
+          if ((cv && vs != "none") || (!cv && a != 0)) next
+
+          cat(sprintf("Parámetros #%d: vt=%.2f, CV=%s, VS=%s, alpha=%.2f\n",
+                      contador, var_threshold, cv, vs, a))
+
+          metricas_fold <- list()
+
+          for (k in 1:nfolds) {
+            idx_valid <- which(folds == k)
+            idx_train <- setdiff(1:length(idx_train_total), idx_valid)
+
+            X_train <- X_train_total[idx_train, ]
+            Y_train <- Y_train_total[idx_train]
+            X_valid <- X_train_total[idx_valid, ]
+            Y_valid <- Y_train_total[idx_valid]
+
+            res <- tryCatch({
+              ajustar_y_graficar_modelos_FPCA_regression(
+                t_grid = t_grid,
+                X = X_train,
+                Y = Y_train,
+                beta_true = beta_true,
+                gamma_true = gamma_true,
+                var_threshold = var_threshold,
+                crossValglmnet = cv,
+                variableSelection = vs,
+                alpha = a,
+                plot_results = FALSE
+              )
+            }, error = function(e) {
+              message(sprintf("Error en fold %d: %s", k, e$message))
+              return(NULL)
+            })
+
+            if (is.null(res)) {
+              next
+            }
+
+            metrica <- evaluar_modelo_funcional_FPCA_regression(modelo = res,
+                                                  X = X_valid,
+                                                  Y = Y_valid,
+                                                  t_grid = t_grid,
+                                                  plot = FALSE)
+
+            metricas_fold[[k]] <- metrica  
+
+          }
+
+          resultados_grid[[contador]] <- list(
+            var_threshold = var_threshold,
+            crossValglmnet = cv,
+            variableSelection = vs,
+            alpha = a,
+            metricas = metricas_fold
+          )
+          contador <- contador + 1
+        }
+      }
+    }
+  }
+
+  auroc_promedios <- numeric(length(resultados_grid))
+
+  for (i in seq_along(resultados_grid)) {
+    metricas_folds <- resultados_grid[[i]]$metricas
+    metricas_folds <- Filter(Negate(is.null), metricas_folds)
+    aurocs <- sapply(metricas_folds, function(m) m$auc_quad)
+    auroc_promedios[i] <- mean(aurocs)
+  }
+
+  mejor_indice <- which.max(auroc_promedios)
+  mejor_modelo <- resultados_grid[[mejor_indice]]
+
+  cat("Mejor AUROC promedio:", auroc_promedios[mejor_indice], "\n")
+  cat("Parámetros del mejor modelo:\n")
+  print(mejor_modelo[c("var_threshold", "crossValglmnet", "variableSelection", "alpha")])
+
+  cat("\nGraficando mejor modelo sobre conjunto de entrenamiento completo...\n")
+  res_mejor_modelo <- ajustar_y_graficar_modelos_FPCA_regression(
+    t_grid = t_grid,
+    X = X_train_total,
+    Y = Y_train_total,
+    beta_true = beta_true,
+    gamma_true = gamma_true,
+    var_threshold = mejor_modelo$var_threshold,
+    crossValglmnet = mejor_modelo$crossValglmnet,
+    variableSelection = mejor_modelo$variableSelection,
+    alpha = mejor_modelo$alpha,
+    plot_results = TRUE
+  )
+
+  cat("\nEvaluando en conjunto de test final...\n")
+  evaluar_modelo_funcional_FPCA_regression(modelo = res_mejor_modelo,
+                                           X = X_test_final,
+                                           Y = Y_test_final,
+                                           t_grid = t_grid,
+                                           plot = TRUE)
+
+  return(list(resultados_grid = resultados_grid,
+              mejor_modelo = mejor_modelo,
+              X_test_final = X_test_final,
+              Y_test_final = Y_test_final))
+}
+
+```
+
+
+```{r}
+sim <- simular_datos_funcionales_binarios(gamma_coef_custom = gamma_coef_A,
+                                          beta_coef_custom = beta_coef_A,
+                                          K_true = K_true,
+                                          n = 3000, M=201)
+
+var_threshold_vals = c(0.75,0.8, 0.85, 0.9, 0.95, 0.99)
+variableSelection_vals = c("none", "LRT", "AIC")
+crossVal_vals = c(FALSE, TRUE)
+alpha_vals = c(0,0.5,1)
+
+grid <- grid_search_cv_FPCA_regression(X = sim$X_true, Y = sim$Y_obs, t_grid = sim$t_grid, beta_true =  sim$beta_true, gamma_true = sim$gamma_true, var_threshold_vals =  var_threshold_vals, variableSelection_vals = variableSelection_vals, crossVal_vals = crossVal_vals, alpha_vals = alpha_vals)
+```
+
+```{r}
+K_true <- 10
+beta_coef_A <- numeric(10)
+beta_coef_A[1] <- 2
+beta_coef_A[2] <- -2.5
+gamma_coef_A <- matrix(0, nrow = 10, ncol = 10)
+gamma_coef_A[1, 1] <- 6.5
+gamma_coef_A[1, 3] <- -5.0
+gamma_coef_A[2, 3] <- -4.3
+gamma_coef_A[2, 2] <- -7.0
+gamma_coef_A[3, 5] <- 10.0
+
+sim <- simular_datos_funcionales_binarios(gamma_coef_custom = gamma_coef_A,
+                                          beta_coef_custom = beta_coef_A,
+                                          K_true = K_true,
+                                          n = 3000, M=201)
+
+grid <- grid_search_cv_FPCA_regression(X = sim$X_true, Y = sim$Y_obs, t_grid = sim$t_grid, beta_true =  sim$beta_true, gamma_true = sim$gamma_true, var_threshold_vals =  var_threshold_vals, variableSelection_vals = variableSelection_vals, crossVal_vals = crossVal_vals, alpha_vals = alpha_vals)
+```
+```{r}
+library(caret)    # Para K-Fold y entrenamiento
+library(dplyr)    # Para manipulación de datos
+library(ggplot2)  # 
+
+# Crear las columnas al cuadrado
+X <- as.data.frame(sim$X_true)
+X_sq <- X^2
+
+# Renombrar las columnas cuadráticas para diferenciarlas
+colnames(X_sq) <- paste0(colnames(X), "_sq")
+
+# Combinar con los datos originales
+data_sim <- cbind(X, X_sq, Y = factor(sim$Y_obs))
+
+# Convertir la respuesta en factores "yes" / "no" (requerido por caret)
+data_sim$Y <- factor(ifelse(data_sim$Y == 1, "yes", "no"), levels = c("no", "yes"))
+
+
+#separo conjunto de held-out
+set.seed(123)
+idx <- sample(1:nrow(data_sim), 0.8 * nrow(data_sim))
+data_train <- data_sim[idx, ]
+data_test  <- data_sim[-idx, ]
+
+# Definir control de entrenamiento con 5-fold CV
+control <- trainControl(
+  method = "cv",
+  number = 4,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = TRUE,
+  sampling = NULL,
+  index = createFolds(data_train$Y, k = 4, returnTrain = TRUE) # 👈 estratificación manual
+)
+
+
+#data_sim = cbind(X = as.data.frame(sim$X_true), Y = factor(sim$Y_obs))
+
+# Ajustar modelo de regresión logística
+modelo_log <- train(
+  Y ~ ., 
+  data = data_train,
+  method = "glm",
+  family = binomial,
+  trControl = control,
+  metric = "ROC"
+)
+
+# Predecir en test
+pred_test <- predict(modelo_log, newdata = data_test, type = "prob")
+auc_heldout <- auc(roc(response = data_test$Y, predictor = pred_test$yes))
+cat("AUC-ROC en held-out:", round(auc_heldout, 4), "\n")
+
+# Calcular AUC-ROC promedio por fold
+library(pROC)
+auc_por_fold <- preds %>%
+  group_by(Resample) %>%
+  summarise(AUC = as.numeric(auc(roc(response = obs, predictor = yes))))
+
+auc_promedio <- mean(auc_por_fold$AUC)
+print(auc_por_fold)
+cat("AUC-ROC promedio:", round(auc_promedio, 4), "\n")
+
+
+```
+```{r}
+sum(sim$Y_obs)/length(sim$Y_obs)
+```
+
+
+
